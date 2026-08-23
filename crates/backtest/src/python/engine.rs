@@ -71,7 +71,7 @@ use super::node::create_config_instance;
 use crate::{
     config::{BacktestEngineConfig, SimulatedVenueConfig},
     engine::BacktestEngine,
-    modules::{FXRolloverInterestModule, SimulationModuleAny},
+    modules::{CfdSwapModule, FXRolloverInterestModule, FundingRateModule, SimulationModuleAny},
     result::BacktestResult,
 };
 
@@ -1689,7 +1689,17 @@ pub(crate) fn pyobject_to_simulation_module_any(
 ) -> PyResult<SimulationModuleAny> {
     if let Ok(cell) = obj.cast::<FXRolloverInterestModule>() {
         let module = cell.borrow().clone();
-        return Ok(SimulationModuleAny::FXRolloverInterest(module));
+        return Ok(SimulationModuleAny::FXRolloverInterest(Box::new(module)));
+    }
+
+    if let Ok(cell) = obj.cast::<FundingRateModule>() {
+        let module = cell.borrow().clone();
+        return Ok(SimulationModuleAny::FundingRate(module));
+    }
+
+    if let Ok(cell) = obj.cast::<CfdSwapModule>() {
+        let module = cell.borrow().clone();
+        return Ok(SimulationModuleAny::CfdSwap(module));
     }
 
     let type_name = obj.get_type().name()?;

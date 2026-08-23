@@ -922,7 +922,9 @@ fn simulation_module_any_to_pyobject(
     module: &SimulationModuleAny,
 ) -> PyResult<Py<PyAny>> {
     match module {
-        SimulationModuleAny::FXRolloverInterest(module) => module.clone().into_py_any(py),
+        SimulationModuleAny::FXRolloverInterest(module) => module.as_ref().clone().into_py_any(py),
+        SimulationModuleAny::FundingRate(module) => module.clone().into_py_any(py),
+        SimulationModuleAny::CfdSwap(module) => module.clone().into_py_any(py),
     }
 }
 

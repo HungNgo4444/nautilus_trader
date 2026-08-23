@@ -15,11 +15,16 @@
 
 //! Simulation module trait for extending backtesting with custom venue behaviors.
 
+pub mod carry;
+pub mod cfd_swap;
+pub mod funding_rate;
 pub mod fx_rollover;
 
 use std::fmt::Display;
 
 use ahash::AHashMap;
+pub use cfd_swap::CfdSwapModule;
+pub use funding_rate::FundingRateModule;
 pub use fx_rollover::FXRolloverInterestModule;
 use indexmap::IndexMap;
 use nautilus_common::cache::Cache;
@@ -49,37 +54,49 @@ pub struct ExchangeContext<'a> {
 
 #[derive(Debug, Clone)]
 pub enum SimulationModuleAny {
-    FXRolloverInterest(FXRolloverInterestModule),
+    FXRolloverInterest(Box<FXRolloverInterestModule>),
+    FundingRate(FundingRateModule),
+    CfdSwap(CfdSwapModule),
 }
 
 impl SimulationModule for SimulationModuleAny {
     fn pre_process(&self, data: &Data) {
         match self {
             Self::FXRolloverInterest(module) => module.pre_process(data),
+            Self::FundingRate(module) => module.pre_process(data),
+            Self::CfdSwap(module) => module.pre_process(data),
         }
     }
 
     fn process(&self, ts_now: UnixNanos, ctx: &ExchangeContext) -> SimulationModuleResult {
         match self {
             Self::FXRolloverInterest(module) => module.process(ts_now, ctx),
+            Self::FundingRate(module) => module.process(ts_now, ctx),
+            Self::CfdSwap(module) => module.process(ts_now, ctx),
         }
     }
 
     fn acknowledge(&self, outcomes: &[AccountAdjustmentOutcome]) {
         match self {
             Self::FXRolloverInterest(module) => module.acknowledge(outcomes),
+            Self::FundingRate(module) => module.acknowledge(outcomes),
+            Self::CfdSwap(module) => module.acknowledge(outcomes),
         }
     }
 
     fn log_diagnostics(&self) {
         match self {
             Self::FXRolloverInterest(module) => module.log_diagnostics(),
+            Self::FundingRate(module) => module.log_diagnostics(),
+            Self::CfdSwap(module) => module.log_diagnostics(),
         }
     }
 
     fn reset(&self) {
         match self {
             Self::FXRolloverInterest(module) => module.reset(),
+            Self::FundingRate(module) => module.reset(),
+            Self::CfdSwap(module) => module.reset(),
         }
     }
 }
@@ -87,7 +104,9 @@ impl SimulationModule for SimulationModuleAny {
 impl From<SimulationModuleAny> for Box<dyn SimulationModule> {
     fn from(value: SimulationModuleAny) -> Self {
         match value {
-            SimulationModuleAny::FXRolloverInterest(module) => Box::new(module),
+            SimulationModuleAny::FXRolloverInterest(module) => module,
+            SimulationModuleAny::FundingRate(module) => Box::new(module),
+            SimulationModuleAny::CfdSwap(module) => Box::new(module),
         }
     }
 }

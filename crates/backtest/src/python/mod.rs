@@ -39,5 +39,10 @@ pub fn backtest(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<engine::PyBacktestEngine>()?;
     m.add_class::<crate::modules::fx_rollover::InterestRateRecord>()?;
     m.add_class::<crate::modules::fx_rollover::FXRolloverInterestModule>()?;
+    m.add_class::<crate::modules::funding_rate::FundingRateModule>()?;
+    m.add_class::<crate::modules::cfd_swap::CfdSwapModule>()?;
+    m.add_function(pyo3::wrap_pyfunction!(modules::py_funding_cash_flow, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(modules::py_swap_cash_flow, m)?)?;
+    m.add_function(pyo3::wrap_pyfunction!(modules::py_cfd_roll_instants_ns, m)?)?;
     Ok(())
 }
