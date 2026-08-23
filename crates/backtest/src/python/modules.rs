@@ -66,12 +66,13 @@ impl FXRolloverInterestModule {
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pymethods]
 impl FundingRateModule {
-    /// Simulates perpetual-swap funding settled on a per-instrument schedule.
+    /// Applies perpetual swap funding at each scheduled settlement.
     ///
-    /// `funding_rates` maps an instrument ID string to a `(ts_ns, rates)` pair of
-    /// parallel ascending lists: `ts_ns` are the settlement timestamps (UNIX
-    /// nanoseconds, UTC) and `rates` the funding rate applied at each. A long
-    /// position pays a positive rate.
+    /// Every settlement at or before the current timestamp that has not yet been
+    /// applied is charged against each open position in that instrument, valued at
+    /// the mark. A settlement instant carrying no data item of its own is drained on
+    /// the following call and charged against the exposure and mark captured before
+    /// the gap, since no fill can occur while the market is gapped.
     #[new]
     fn py_new(funding_rates: IndexMap<String, (Vec<u64>, Vec<f64>)>) -> PyResult<Self> {
         Self::new(funding_rates).map_err(to_pyvalue_err)
@@ -81,18 +82,21 @@ impl FundingRateModule {
         format!("{self:?}")
     }
 
+    /// Returns the applied funding cost across all instruments, positive when paid.
     #[getter]
     #[pyo3(name = "total_cost")]
     fn py_total_cost(&self) -> f64 {
         self.total_cost()
     }
 
+    /// Returns the funding cost the exchange could not apply.
     #[getter]
     #[pyo3(name = "unapplied_cost")]
     fn py_unapplied_cost(&self) -> f64 {
         self.unapplied_cost()
     }
 
+    /// Returns the applied funding cost per instrument.
     #[getter]
     #[pyo3(name = "instrument_costs")]
     fn py_instrument_costs(&self) -> IndexMap<String, f64> {
@@ -102,6 +106,7 @@ impl FundingRateModule {
             .collect()
     }
 
+    /// Returns every applied settlement timestamp and cost, in charge order.
     #[getter]
     #[pyo3(name = "settlements")]
     fn py_settlements(&self) -> Vec<(u64, f64)> {
@@ -115,13 +120,13 @@ impl FundingRateModule {
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pymethods]
 impl CfdSwapModule {
-    /// Simulates CFD overnight swap charged at 17:00 `America/New_York`.
+    /// Applies CFD overnight swap at the broker rollover, 17:00 `America/New_York`.
     ///
-    /// `swap_specs` maps an instrument ID string to a
-    /// `(swap_mode, swap_long, swap_short, contract_size, swap_3day_dow)` tuple.
-    /// `swap_mode` is one of `disabled`, `ccy_margin` or `interest`, the swap
-    /// points already carry their sign (negative = the account pays), and
-    /// `swap_3day_dow` is the ISO weekday charged triple.
+    /// Every rollover at or before the current timestamp that has not yet been
+    /// applied is charged, so a rollover landing in a data gap is not dropped. A run
+    /// that starts after the day's rollover is not retro-charged. A rollover that
+    /// fell inside a gap is charged against the exposure and mark captured before
+    /// the gap, since no fill can occur while the market is gapped.
     #[new]
     fn py_new(swap_specs: IndexMap<String, (String, f64, f64, f64, u8)>) -> PyResult<Self> {
         Self::new(swap_specs).map_err(to_pyvalue_err)
@@ -131,18 +136,21 @@ impl CfdSwapModule {
         format!("{self:?}")
     }
 
+    /// Returns the applied swap cost across all instruments, positive when paid.
     #[getter]
     #[pyo3(name = "total_cost")]
     fn py_total_cost(&self) -> f64 {
         self.total_cost()
     }
 
+    /// Returns the swap cost the exchange could not apply.
     #[getter]
     #[pyo3(name = "unapplied_cost")]
     fn py_unapplied_cost(&self) -> f64 {
         self.unapplied_cost()
     }
 
+    /// Returns the applied swap cost per instrument.
     #[getter]
     #[pyo3(name = "instrument_costs")]
     fn py_instrument_costs(&self) -> IndexMap<String, f64> {
@@ -153,7 +161,10 @@ impl CfdSwapModule {
     }
 }
 
-/// Returns the signed cash flow (quote currency) for one funding settlement.
+/// Returns the signed cash flow for one funding settlement in the quote currency.
+///
+/// A long position pays a positive rate. `notional_abs` is the unsigned
+/// position notional.
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.backtest")]
 #[pyfunction]
 #[pyo3(name = "funding_cash_flow")]
@@ -162,7 +173,11 @@ pub fn py_funding_cash_flow(rate: f64, notional_abs: f64, is_long: bool) -> f64 
     funding_cash_flow(rate, notional_abs, is_long)
 }
 
-/// Returns the signed cash flow (quote currency) for one rollover night.
+/// Returns the signed cash flow for one rollover night in the quote currency.
+///
+/// `iso_weekday` is the ISO weekday of the rollover instant; weekend nights do
+/// not roll and `swap_3day_dow` is charged triple. The swap points carry their
+/// own sign, and an unrecognised mode charges nothing.
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.backtest")]
 #[pyfunction]
 #[pyo3(name = "swap_cash_flow", signature = (swap_mode, swap_long, swap_short, is_long, iso_weekday, notional_abs, lots, swap_3day_dow = 5))]
@@ -190,7 +205,10 @@ pub fn py_swap_cash_flow(
     )
 }
 
-/// Returns every chargeable 17:00-ET rollover instant in `[start_ns, end_ns)`.
+/// Returns every chargeable rollover instant in `[start_ns, end_ns)`.
+///
+/// Weekend instants are omitted, since the module never charges them. A window opening before
+/// the first representable rollover simply starts at that rollover.
 #[pyo3_stub_gen::derive::gen_stub_pyfunction(module = "nautilus_trader.backtest")]
 #[pyfunction]
 #[pyo3(name = "cfd_roll_instants_ns")]

@@ -28,6 +28,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     task::{Context, Poll, Waker},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 
@@ -305,12 +306,141 @@ impl PyNodeRunWake {
     }
 }
 
+/// Wake state shared with the pump thread.
+#[derive(Debug, Default)]
+struct PumpSignal {
+    pending: bool,
+    stopping: bool,
+}
+
+/// Carries wakes to the host event loop on a thread that holds no other lock.
+///
+/// A tokio worker commonly wakes the run while holding an internal lock the host thread is about
+/// to take; acquiring the GIL there would deadlock the pair. Waking therefore only signals this
+/// pump, and the pump alone touches Python.
+#[derive(Debug, Default)]
+struct WakePump {
+    signal: Mutex<PumpSignal>,
+    changed: Condvar,
+}
+
+impl WakePump {
+    /// Records a wake without blocking on Python.
+    fn notify(&self) {
+        self.signal.lock().expect(MUTEX_POISONED).pending = true;
+        self.changed.notify_one();
+    }
+
+    /// Asks the pump thread to finish.
+    fn stop(&self) {
+        self.signal.lock().expect(MUTEX_POISONED).stopping = true;
+        self.changed.notify_all();
+    }
+
+    /// Waits for the next wake, returning `false` once the pump is stopping.
+    fn wait(&self) -> bool {
+        let mut signal = self.signal.lock().expect(MUTEX_POISONED);
+        while !signal.pending && !signal.stopping {
+            signal = self.changed.wait(signal).expect(MUTEX_POISONED);
+        }
+
+        if signal.stopping {
+            return false;
+        }
+
+        signal.pending = false;
+        true
+    }
+}
+
+/// Owns the pump thread serving one hosted run.
+#[derive(Debug)]
+struct WakePumpHandle {
+    pump: Arc<WakePump>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl WakePumpHandle {
+    /// Starts the pump thread that schedules the run's resume callback.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the thread cannot be spawned.
+    fn spawn(
+        event_loop: Py<PyAny>,
+        wake_callback: Py<PyAny>,
+        handle: LiveNodeHandle,
+    ) -> std::io::Result<Self> {
+        let pump = Arc::new(WakePump::default());
+        let signal = pump.clone();
+
+        let thread = std::thread::Builder::new()
+            .name("nautilus-node-wake".to_string())
+            .spawn(move || {
+                while signal.wait() {
+                    Python::attach(|py| {
+                        if let Err(e) = event_loop.bind(py).call_method1(
+                            intern!(py, "call_soon_threadsafe"),
+                            (wake_callback.bind(py),),
+                        ) {
+                            // Nothing can resume the run once the host loop is gone, so request a
+                            // stop and leave the awaiting task to surface the failure.
+                            log::error!(
+                                "Failed to schedule hosted run wake-up, stopping node: {e}"
+                            );
+                            handle.stop();
+                        }
+                    });
+                }
+
+                // Releasing the last reference to a Python object needs the GIL.
+                Python::attach(move |_| {
+                    drop(event_loop);
+                    drop(wake_callback);
+                });
+            })?;
+
+        Ok(Self {
+            pump,
+            thread: Some(thread),
+        })
+    }
+
+    /// Returns the signal a waker notifies.
+    fn signal(&self) -> Arc<WakePump> {
+        self.pump.clone()
+    }
+
+    /// Stops the pump thread and waits for it to exit.
+    ///
+    /// The pump may be blocked acquiring the GIL, so the caller must not hold it here.
+    fn shutdown(&mut self) {
+        self.pump.stop();
+
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for WakePumpHandle {
+    fn drop(&mut self) {
+        if self.thread.is_none() {
+            return;
+        }
+
+        // Reached when a run is dropped before completing; the pump still needs the GIL to finish.
+        Python::attach(|py| py.detach(|| self.shutdown()));
+    }
+}
+
 /// Waker that resumes a hosted run from whichever thread completed the work.
+///
+/// Waking never touches Python, so a tokio worker holding an internal lock cannot park on the GIL
+/// the host thread holds while it polls.
 struct HostLoopWaker {
-    event_loop: Py<PyAny>,
-    wake_callback: Py<PyAny>,
+    pump: Arc<WakePump>,
     state: Arc<RunWakeState>,
-    handle: LiveNodeHandle,
 }
 
 impl std::task::Wake for HostLoopWaker {
@@ -330,17 +460,7 @@ impl std::task::Wake for HostLoopWaker {
             return;
         }
 
-        Python::attach(|py| {
-            if let Err(e) = self.event_loop.bind(py).call_method1(
-                intern!(py, "call_soon_threadsafe"),
-                (self.wake_callback.bind(py),),
-            ) {
-                // Nothing can resume the run once the host loop is gone, so request a stop and
-                // leave the awaiting task to surface the failure.
-                log::error!("Failed to schedule hosted run wake-up, stopping node: {e}");
-                self.handle.stop();
-            }
-        });
+        self.pump.notify();
     }
 }
 
@@ -358,6 +478,7 @@ pub struct PyNodeRun {
     event_loop: Py<PyAny>,
     waker: Waker,
     state: Arc<RunWakeState>,
+    pump: WakePumpHandle,
     pending_throw: Option<PyErr>,
 }
 
@@ -390,7 +511,7 @@ impl PyNodeRun {
         owner: Rc<RefCell<Option<LiveNode>>>,
         event_loop: Bound<'_, PyAny>,
         state: Arc<RunWakeState>,
-        wake_callback: Py<PyAny>,
+        pump: WakePumpHandle,
     ) -> Self {
         let handle = node.handle();
         let mut node = Box::new(node);
@@ -405,10 +526,8 @@ impl PyNodeRun {
         });
 
         let waker = Waker::from(Arc::new(HostLoopWaker {
-            event_loop: event_loop.clone().unbind(),
-            wake_callback,
+            pump: pump.signal(),
             state: state.clone(),
-            handle: handle.clone(),
         }));
 
         Self {
@@ -419,6 +538,7 @@ impl PyNodeRun {
             event_loop: event_loop.unbind(),
             waker,
             state,
+            pump,
             pending_throw: None,
         }
     }
@@ -437,6 +557,15 @@ impl PyNodeRun {
             // set the guard. Clearing unconditionally would let a late drop release a newer run's.
             HOSTED_RUN_ACTIVE.set(false);
         }
+    }
+
+    /// Ends the run: stops the pump, then returns the node to the wrapper.
+    ///
+    /// The pump can be parked on the GIL, so the join happens with the GIL released.
+    fn finish(&mut self, py: Python<'_>) {
+        let pump = &mut self.pump;
+        py.detach(|| pump.shutdown());
+        self.restore_node();
     }
 
     /// Returns whether the host event loop is currently running.
@@ -470,7 +599,7 @@ impl PyNodeRun {
                 if let Err(e) = result {
                     log::error!("Hosted run failed during inline shutdown: {e}");
                 }
-                self.restore_node();
+                self.finish(py);
                 return;
             }
 
@@ -502,7 +631,7 @@ impl PyNodeRun {
 
         match poll {
             Poll::Ready(result) => {
-                self.restore_node();
+                self.finish(py);
 
                 if let Err(e) = &result {
                     log::error!("Hosted run failed: {e}");
@@ -831,12 +960,21 @@ impl PyLiveNode {
         )?
         .into_any();
 
+        // The pump owns the only Python touch on the wake path, so it starts before the node is
+        // taken and a spawn failure stays a plain error.
+        let pump = WakePumpHandle::spawn(
+            event_loop.clone().unbind(),
+            wake_callback,
+            self.handle.clone(),
+        )
+        .map_err(to_pyruntime_err)?;
+
         let node = self
             .inner
             .borrow_mut()
             .take()
             .ok_or_else(node_consumed_err)?;
-        let run = PyNodeRun::new(node, self.inner.clone(), event_loop, state, wake_callback);
+        let run = PyNodeRun::new(node, self.inner.clone(), event_loop, state, pump);
         HOSTED_RUN_ACTIVE.set(true);
 
         driver.call1(py, (Py::new(py, run)?,))
@@ -2310,8 +2448,67 @@ mod tests {
     };
     use rstest::rstest;
 
-    use super::{LiveNode, PyLiveNode, PyLiveNodeBuilder};
+    use super::{
+        HostLoopWaker, LiveNode, LiveNodeHandle, PyLiveNode, PyLiveNodeBuilder, PyNodeRunWake,
+        RunWakeState, WakePumpHandle,
+    };
     use crate::node::config::RoutingConfig;
+
+    /// A wake arriving from a worker thread must not park on the GIL the host thread holds while
+    /// it polls, or the two deadlock whenever the worker also holds an internal lock.
+    #[rstest]
+    fn test_hosted_run_wake_never_blocks_on_the_gil() {
+        Python::initialize();
+
+        Python::attach(|py| {
+            // A real asyncio loop cannot be built off the main thread on Windows, and only
+            // `call_soon_threadsafe` matters here.
+            let module = PyModule::new(py, "nautilus_wake_pump_test").unwrap();
+            let code = CString::new(
+                "
+class Loop:
+    def call_soon_threadsafe(self, callback):
+        pass
+",
+            )
+            .unwrap();
+            py.run(code.as_c_str(), Some(&module.dict()), None).unwrap();
+            let event_loop = module.getattr("Loop").unwrap().call0().unwrap();
+
+            let state = Arc::new(RunWakeState::default());
+            let wake_callback = Py::new(
+                py,
+                PyNodeRunWake {
+                    state: state.clone(),
+                },
+            )
+            .unwrap()
+            .into_any();
+
+            let mut pump = WakePumpHandle::spawn(
+                event_loop.clone().unbind(),
+                wake_callback,
+                LiveNodeHandle::new(),
+            )
+            .unwrap();
+            let waker = std::task::Waker::from(Arc::new(HostLoopWaker {
+                pump: pump.signal(),
+                state,
+            }));
+
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                waker.wake_by_ref();
+                tx.send(()).unwrap();
+            });
+
+            // The GIL is held right here, so a wake that needed it would never report back.
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("waking a hosted run must not block on the GIL");
+
+            py.detach(|| pump.shutdown());
+        });
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum ShutdownRunPath {

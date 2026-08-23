@@ -127,14 +127,16 @@ pub fn swap_cash_flow(
 }
 
 /// Returns the 17:00 Eastern rollover instant of a date, in UNIX nanoseconds.
-fn roll_time_ns(date: Date) -> u64 {
+///
+/// Returns `None` for a pre-epoch instant, which no UNIX-nanosecond window can contain.
+fn roll_time_ns(date: Date) -> Option<u64> {
     let rollover_eastern = date.to_datetime(Time::constant(17, 0, 0, 0));
     let timestamp = eastern_timezone()
         .to_ambiguous_timestamp(rollover_eastern)
         .unambiguous()
         .expect("unambiguous rollover time")
         .as_nanosecond();
-    u64::try_from(timestamp).expect("rollover timestamp in range")
+    u64::try_from(timestamp).ok()
 }
 
 /// Returns the Eastern calendar date of an instant.
@@ -150,29 +152,31 @@ fn weekday_of(date: Date) -> u8 {
 
 /// Returns every chargeable rollover instant in `[start_ns, end_ns)`.
 ///
-/// Weekend instants are omitted, since the module never charges them.
-///
-/// # Panics
-///
-/// Panics if an instant in the range is not representable.
+/// Weekend instants are omitted, since the module never charges them. A window opening before
+/// the first representable rollover simply starts at that rollover.
 #[must_use]
 pub fn cfd_roll_instants_ns(start_ns: u64, end_ns: u64) -> Vec<u64> {
+    let mut out = Vec::new();
     let mut date = eastern_date(UnixNanos::from(start_ns));
-    let mut roll = roll_time_ns(date);
-    while roll < start_ns {
-        date = date.tomorrow().expect("next rollover date in range");
-        roll = roll_time_ns(date);
+
+    loop {
+        match roll_time_ns(date) {
+            Some(roll) if roll >= end_ns => break,
+            Some(roll) if roll >= start_ns => {
+                let iso_weekday = weekday_of(date);
+                if iso_weekday != SATURDAY && iso_weekday != SUNDAY {
+                    out.push(roll);
+                }
+            }
+            _ => {}
+        }
+
+        let Ok(next) = date.tomorrow() else {
+            break;
+        };
+        date = next;
     }
 
-    let mut out = Vec::new();
-    while roll < end_ns {
-        let iso_weekday = weekday_of(date);
-        if iso_weekday != SATURDAY && iso_weekday != SUNDAY {
-            out.push(roll);
-        }
-        date = date.tomorrow().expect("next rollover date in range");
-        roll = roll_time_ns(date);
-    }
     out
 }
 
@@ -310,8 +314,15 @@ impl CfdSwapModule {
     }
 
     fn set_next_roll(&self, date: Date) {
-        self.state.next_roll_ns.set(roll_time_ns(date));
-        self.state.next_roll_date.replace(Some(date));
+        let mut date = date;
+        loop {
+            if let Some(roll) = roll_time_ns(date) {
+                self.state.next_roll_ns.set(roll);
+                self.state.next_roll_date.replace(Some(date));
+                return;
+            }
+            date = date.tomorrow().expect("next rollover date in range");
+        }
     }
 
     /// Snapshots every open position, and its mark, on a configured instrument.
@@ -449,7 +460,7 @@ impl SimulationModule for CfdSwapModule {
         if !self.state.initialized.get() {
             self.state.initialized.set(true);
             let date = eastern_date(ts_now);
-            if ts_now.as_u64() < roll_time_ns(date) {
+            if roll_time_ns(date).is_some_and(|roll| ts_now.as_u64() < roll) {
                 self.set_next_roll(date);
             } else {
                 self.set_next_roll(date.tomorrow().expect("next rollover date in range"));
@@ -680,10 +691,38 @@ mod tests {
     #[rstest]
     fn test_roll_time_tracks_us_dst() {
         // 2024-03-09 is EST (UTC-5) -> 22:00 UTC; 2024-03-11 is EDT (UTC-4) -> 21:00 UTC.
-        let est = roll_time_ns(Date::new(2024, 3, 9).unwrap());
-        let edt = roll_time_ns(Date::new(2024, 3, 11).unwrap());
+        let est = roll_time_ns(Date::new(2024, 3, 9).unwrap()).unwrap();
+        let edt = roll_time_ns(Date::new(2024, 3, 11).unwrap()).unwrap();
         assert_eq!(est % 86_400_000_000_000, 22 * 3_600_000_000_000);
         assert_eq!(edt % 86_400_000_000_000, 21 * 3_600_000_000_000);
+    }
+
+    #[rstest]
+    #[case(0, 0)]
+    #[case(1, 1)]
+    #[case(0, 17_999_999_999_999)]
+    #[case(17_999_999_999_999, 17_999_999_999_999)]
+    fn test_roll_instants_before_first_rollover_are_empty(
+        #[case] start_ns: u64,
+        #[case] end_ns: u64,
+    ) {
+        assert!(cfd_roll_instants_ns(start_ns, end_ns).is_empty());
+    }
+
+    #[rstest]
+    fn test_roll_instants_from_epoch_start_at_first_representable_rollover() {
+        // 1969-12-31 17:00 ET predates the epoch, so the first instant is 1970-01-01 17:00 ET.
+        let instants = cfd_roll_instants_ns(0, 200_000_000_000_000);
+        assert_eq!(instants, vec![79_200_000_000_000, 165_600_000_000_000]);
+    }
+
+    #[rstest]
+    fn test_roll_time_ns_is_none_before_the_epoch() {
+        assert!(roll_time_ns(Date::new(1969, 12, 31).unwrap()).is_none());
+        assert_eq!(
+            roll_time_ns(Date::new(1970, 1, 1).unwrap()),
+            Some(79_200_000_000_000)
+        );
     }
 
     #[rstest]

@@ -20,8 +20,13 @@ __all__ = [
     "BacktestResult",
     "BacktestRunConfig",
     "BacktestVenueConfig",
+    "CfdSwapModule",
     "FXRolloverInterestModule",
+    "FundingRateModule",
     "InterestRateRecord",
+    "cfd_roll_instants_ns",
+    "funding_cash_flow",
+    "swap_cash_flow",
 ]
 
 @typing.final
@@ -357,8 +362,34 @@ class BacktestVenueConfig:
     ) -> BacktestVenueConfig: ...
 
 @typing.final
+class CfdSwapModule:
+    @property
+    def total_cost(self) -> float: ...
+    @property
+    def unapplied_cost(self) -> float: ...
+    @property
+    def instrument_costs(self) -> dict[str, float]: ...
+    def __new__(
+        cls, swap_specs: typing.Mapping[str, tuple[str, float, float, float, int]]
+    ) -> CfdSwapModule: ...
+
+@typing.final
 class FXRolloverInterestModule:
     def __new__(cls, records: typing.Sequence[InterestRateRecord]) -> FXRolloverInterestModule: ...
+
+@typing.final
+class FundingRateModule:
+    @property
+    def total_cost(self) -> float: ...
+    @property
+    def unapplied_cost(self) -> float: ...
+    @property
+    def instrument_costs(self) -> dict[str, float]: ...
+    @property
+    def settlements(self) -> list[tuple[int, float]]: ...
+    def __new__(
+        cls, funding_rates: typing.Mapping[str, tuple[typing.Sequence[int], typing.Sequence[float]]]
+    ) -> FundingRateModule: ...
 
 @typing.final
 class InterestRateRecord:
@@ -491,3 +522,16 @@ class BacktestEngine:
     def generate_account_report(
         self, venue: model.Venue | None = None, account_id: model.AccountId | None = None
     ) -> typing.Any: ...
+
+def cfd_roll_instants_ns(start_ns: int, end_ns: int) -> list[int]: ...
+def funding_cash_flow(rate: float, notional_abs: float, is_long: bool) -> float: ...
+def swap_cash_flow(
+    swap_mode: str,
+    swap_long: float,
+    swap_short: float,
+    is_long: bool,
+    iso_weekday: int,
+    notional_abs: float,
+    lots: float,
+    swap_3day_dow: int = 5,
+) -> float: ...
