@@ -282,6 +282,13 @@ pub struct HyperliquidExecClientConfig {
     /// instruments; an empty list queries only the default perp dex. The default
     /// dex is always queried.
     pub reconciliation_dexs: Option<Vec<String>>,
+    /// The collateral pool the account state reads.
+    ///
+    /// `None` reads the default perp clearinghouse combined with spot balances.
+    /// A builder (HIP-3) dex name reads that dex's clearinghouse alone: builder
+    /// dexes margin their own collateral, so a session trading one reports that
+    /// pool rather than a sum no venue arithmetic uses.
+    pub account_dex: Option<String>,
 }
 
 #[cfg(feature = "python")]
@@ -302,6 +309,7 @@ nautilus_core::impl_pyo3_config_getters!(HyperliquidExecClientConfig {
     ws_post_timeout_secs: u64,
     transport_backend: TransportBackend,
     reconciliation_dexs: Option<Vec<String>>,
+    account_dex: Option<String>,
 });
 
 impl Default for HyperliquidExecClientConfig {

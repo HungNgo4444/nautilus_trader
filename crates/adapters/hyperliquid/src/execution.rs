@@ -163,7 +163,7 @@ use crate::{
         parse::{
             clamp_price_to_precision, derive_limit_from_trigger, derive_market_order_price,
             extract_error_message, extract_inner_error, extract_inner_errors, normalize_price,
-            order_to_hyperliquid_request_with_asset_and_cloid,
+            order_to_hyperliquid_request_with_asset_and_cloid, parse_account_balances_and_margins,
             parse_combined_account_balances_and_margins, round_to_sig_figs,
         },
         socket::{SocketStatePublisher, USER_STREAMS_ENDPOINT},
@@ -428,6 +428,7 @@ impl HyperliquidExecutionClient {
         http_client.set_market_order_slippage_bps(config.market_order_slippage_bps);
         http_client.set_include_builder_attribution(config.include_builder_attribution);
         http_client.set_reconciliation_dexs(config.reconciliation_dexs.clone());
+        http_client.set_account_dex(config.account_dex.clone());
 
         // Apply URL overrides from config (used for testing with mock servers)
         if let Some(url) = &config.base_url_http {
@@ -513,20 +514,38 @@ impl HyperliquidExecutionClient {
     async fn refresh_account_state(&self) -> anyhow::Result<()> {
         let account_address = self.get_account_address()?;
 
-        let (perp_state, builder_states, spot_state) = self
+        // A builder (HIP-3) dex margins its own collateral: with `account_dex`
+        // set, that dex's clearinghouse is the whole account and spot balances
+        // belong to the default session instead.
+        if let Some(dex) = self.config.account_dex.as_deref() {
+            let dex_json = self
+                .http_client
+                .info_clearinghouse_state_for_dex(&account_address, Some(dex))
+                .await
+                .context("failed to fetch builder clearinghouse state")?;
+            let dex_state: ClearinghouseState = serde_json::from_value(dex_json)
+                .context("failed to deserialize builder clearinghouse state")?;
+            let (balances, margins) = parse_account_balances_and_margins(&dex_state)
+                .context("failed to parse builder account balances and margins")?;
+            let ts_event = self.clock.get_time_ns();
+            self.emitter
+                .emit_account_state(balances, margins, true, ts_event, None);
+            return Ok(());
+        }
+
+        let (perp_state, spot_state) = self
             .fetch_combined_clearinghouse_state(&account_address)
             .await?;
 
         log::debug!(
-            "Received clearinghouse state: cross_margin_summary={:?}, asset_positions={}, builder_dexes={}, spot_balances={}",
+            "Received clearinghouse state: cross_margin_summary={:?}, asset_positions={}, spot_balances={}",
             perp_state.cross_margin_summary,
             perp_state.asset_positions.len(),
-            builder_states.len(),
             spot_state.balances.len(),
         );
 
         let (balances, margins) =
-            parse_combined_account_balances_and_margins(&perp_state, &builder_states, &spot_state)
+            parse_combined_account_balances_and_margins(&perp_state, &spot_state)
                 .context("failed to parse combined account balances and margins")?;
 
         // Emit even when both sides are empty so the account registers for
@@ -542,11 +561,7 @@ impl HyperliquidExecutionClient {
     async fn fetch_combined_clearinghouse_state(
         &self,
         account_address: &str,
-    ) -> anyhow::Result<(
-        ClearinghouseState,
-        Vec<ClearinghouseState>,
-        SpotClearinghouseState,
-    )> {
+    ) -> anyhow::Result<(ClearinghouseState, SpotClearinghouseState)> {
         let perp_json = self
             .http_client
             .info_clearinghouse_state(account_address)
@@ -554,19 +569,6 @@ impl HyperliquidExecutionClient {
             .context("failed to fetch clearinghouse state")?;
         let perp_state: ClearinghouseState = serde_json::from_value(perp_json)
             .context("failed to deserialize clearinghouse state")?;
-
-        let builder_jsons = self
-            .http_client
-            .info_builder_clearinghouse_states(account_address)
-            .await
-            .context("failed to fetch builder clearinghouse states")?;
-        let mut builder_states = Vec::with_capacity(builder_jsons.len());
-        for builder_json in builder_jsons {
-            builder_states.push(
-                serde_json::from_value(builder_json)
-                    .context("failed to deserialize builder clearinghouse state")?,
-            );
-        }
 
         let spot_json = self
             .http_client
@@ -576,7 +578,7 @@ impl HyperliquidExecutionClient {
         let spot_state: SpotClearinghouseState = serde_json::from_value(spot_json)
             .context("failed to deserialize spot clearinghouse state")?;
 
-        Ok((perp_state, builder_states, spot_state))
+        Ok((perp_state, spot_state))
     }
 
     async fn await_account_registered(&self, timeout_secs: f64) -> anyhow::Result<()> {
@@ -1568,8 +1570,23 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let account_address = self.get_account_address()?;
         let emitter = self.emitter.clone();
         let clock = self.clock;
+        let account_dex = self.config.account_dex.clone();
 
         self.spawn_task("query_account", async move {
+            if let Some(dex) = account_dex.as_deref() {
+                let dex_json = http_client
+                    .info_clearinghouse_state_for_dex(&account_address, Some(dex))
+                    .await
+                    .context("failed to fetch builder clearinghouse state")?;
+                let dex_state: ClearinghouseState = serde_json::from_value(dex_json)
+                    .context("failed to deserialize builder clearinghouse state")?;
+                let (balances, margins) = parse_account_balances_and_margins(&dex_state)
+                    .context("failed to parse builder account balances and margins")?;
+                let ts_event = clock.get_time_ns();
+                emitter.emit_account_state(balances, margins, true, ts_event, None);
+                return Ok(());
+            }
+
             let perp_json = http_client
                 .info_clearinghouse_state(&account_address)
                 .await
@@ -1578,19 +1595,6 @@ impl ExecutionClient for HyperliquidExecutionClient {
             let perp_state: ClearinghouseState = serde_json::from_value(perp_json)
                 .context("failed to deserialize clearinghouse state")?;
 
-            let builder_jsons = http_client
-                .info_builder_clearinghouse_states(&account_address)
-                .await
-                .context("failed to fetch builder clearinghouse states")?;
-            let mut builder_states: Vec<ClearinghouseState> =
-                Vec::with_capacity(builder_jsons.len());
-            for builder_json in builder_jsons {
-                builder_states.push(
-                    serde_json::from_value(builder_json)
-                        .context("failed to deserialize builder clearinghouse state")?,
-                );
-            }
-
             let spot_json = http_client
                 .info_spot_clearinghouse_state(&account_address)
                 .await
@@ -1598,12 +1602,9 @@ impl ExecutionClient for HyperliquidExecutionClient {
             let spot_state: SpotClearinghouseState = serde_json::from_value(spot_json)
                 .context("failed to deserialize spot clearinghouse state")?;
 
-            let (balances, margins) = parse_combined_account_balances_and_margins(
-                &perp_state,
-                &builder_states,
-                &spot_state,
-            )
-            .context("failed to parse combined account balances and margins")?;
+            let (balances, margins) =
+                parse_combined_account_balances_and_margins(&perp_state, &spot_state)
+                    .context("failed to parse combined account balances and margins")?;
             let ts_event = clock.get_time_ns();
             emitter.emit_account_state(balances, margins, true, ts_event, None);
 

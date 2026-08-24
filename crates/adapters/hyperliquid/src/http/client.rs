@@ -70,8 +70,9 @@ use crate::{
             bar_type_to_interval, cache_alias_for_symbol, clamp_price_to_precision,
             derive_limit_from_trigger, determine_order_list_grouping, extract_inner_error,
             normalize_price, order_to_hyperliquid_request_with_asset_and_cloid,
-            parse_combined_account_balances_and_margins, parse_spot_account_balances,
-            parse_trigger_order_type, round_to_sig_figs, time_in_force_to_hyperliquid_tif,
+            parse_account_balances_and_margins, parse_combined_account_balances_and_margins,
+            parse_spot_account_balances, parse_trigger_order_type, round_to_sig_figs,
+            time_in_force_to_hyperliquid_tif,
         },
     },
     data::candle_to_bar,
@@ -912,6 +913,8 @@ pub struct HyperliquidHttpClient {
     include_builder_attribution: bool,
     /// Builder dexes included in unfiltered reconciliation; `None` includes every cached one.
     reconciliation_dexs: Option<Vec<Ustr>>,
+    /// The collateral pool the account state reads; `None` = default perp + spot.
+    account_dex: Option<Ustr>,
 }
 
 impl Default for HyperliquidHttpClient {
@@ -966,6 +969,7 @@ impl HyperliquidHttpClient {
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
             include_builder_attribution: true,
             reconciliation_dexs: None,
+            account_dex: None,
         }
     }
 
@@ -1085,6 +1089,7 @@ impl HyperliquidHttpClient {
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
             include_builder_attribution: true,
             reconciliation_dexs: None,
+            account_dex: None,
         })
     }
 
@@ -1164,6 +1169,7 @@ impl HyperliquidHttpClient {
                     market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
                     include_builder_attribution: true,
                     reconciliation_dexs: None,
+                    account_dex: None,
                 })
             }
             None => {
@@ -1209,6 +1215,7 @@ impl HyperliquidHttpClient {
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
             include_builder_attribution: true,
             reconciliation_dexs: None,
+            account_dex: None,
         })
     }
 
@@ -1258,6 +1265,14 @@ impl HyperliquidHttpClient {
     pub fn set_reconciliation_dexs(&mut self, dexs: Option<Vec<String>>) {
         self.reconciliation_dexs =
             dexs.map(|dexs| dexs.iter().map(|dex| Ustr::from(dex)).collect());
+    }
+
+    /// Sets the collateral pool the account state reads.
+    ///
+    /// `None` reads the default perp clearinghouse combined with spot balances;
+    /// a builder (HIP-3) dex name reads that dex's clearinghouse alone.
+    pub fn set_account_dex(&mut self, dex: Option<String>) {
+        self.account_dex = dex.map(|dex| Ustr::from(&dex));
     }
 
     /// Gets the user address derived from the private key (if client has credentials).
@@ -1834,27 +1849,7 @@ impl HyperliquidHttpClient {
         self.inner.info_clearinghouse_state(user).await
     }
 
-    /// Get clearinghouse state for every builder dex reconciliation covers, in dex order.
-    ///
-    /// Builder-deployed (HIP-3) dexes hold per-dex collateral the default perp
-    /// clearinghouse never reflects.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if any dex's request fails.
-    pub async fn info_builder_clearinghouse_states(&self, user: &str) -> Result<Vec<Value>> {
-        let mut states = Vec::new();
-        for dex in self.reconciliation_dexes(None) {
-            let Some(dex) = dex else { continue };
-            states.push(
-                self.info_clearinghouse_state_for_dex(user, Some(dex.as_str()))
-                    .await?,
-            );
-        }
-        Ok(states)
-    }
-
-    async fn info_clearinghouse_state_for_dex(
+    pub(crate) async fn info_clearinghouse_state_for_dex(
         &self,
         user: &str,
         dex: Option<&str>,
@@ -2777,8 +2772,37 @@ impl HyperliquidHttpClient {
         let account_id = self
             .account_id
             .ok_or_else(|| Error::bad_request("Account ID not set"))?;
-        let state_response = self.info_clearinghouse_state(user).await?;
         let ts_init = self.clock.get_time_ns();
+
+        // A builder (HIP-3) dex margins its own collateral: with `account_dex`
+        // set, that dex's clearinghouse is the whole account and spot balances
+        // belong to the default session instead.
+        if let Some(dex) = self.account_dex {
+            let state_response = self
+                .info_clearinghouse_state_for_dex(user, Some(dex.as_str()))
+                .await?;
+            let dex_state: ClearinghouseState = serde_json::from_value(state_response.clone())
+                .map_err(|e| {
+                    log::error!("Failed to parse builder clearinghouse state: {e}");
+                    log::debug!("Raw response: {state_response}");
+                    Error::bad_request(format!("Failed to parse builder clearinghouse state: {e}"))
+                })?;
+            let (balances, margins) = parse_account_balances_and_margins(&dex_state)
+                .map_err(|e| Error::decode(e.to_string()))?;
+            return Ok(AccountState::new(
+                account_id,
+                AccountType::Margin,
+                balances,
+                margins,
+                true, // reported
+                UUID4::new(),
+                ts_init,
+                ts_init,
+                None,
+            ));
+        }
+
+        let state_response = self.info_clearinghouse_state(user).await?;
 
         log::trace!("Clearinghouse state response: {state_response}");
 
@@ -2788,16 +2812,6 @@ impl HyperliquidHttpClient {
                 log::debug!("Raw response: {state_response}");
                 Error::bad_request(format!("Failed to parse clearinghouse state: {e}"))
             })?;
-
-        let builder_responses = self.info_builder_clearinghouse_states(user).await?;
-        let mut builder_states: Vec<ClearinghouseState> =
-            Vec::with_capacity(builder_responses.len());
-        for builder_response in builder_responses {
-            builder_states.push(serde_json::from_value(builder_response).map_err(|e| {
-                log::error!("Failed to parse builder clearinghouse state: {e}");
-                Error::bad_request(format!("Failed to parse builder clearinghouse state: {e}"))
-            })?);
-        }
 
         // Spot must not be silently dropped: a 429 or parse error would
         // otherwise make non-USDC holdings look like they vanished.
@@ -2810,7 +2824,7 @@ impl HyperliquidHttpClient {
             })?;
 
         let (balances, margins) =
-            parse_combined_account_balances_and_margins(&perp_state, &builder_states, &spot_state)
+            parse_combined_account_balances_and_margins(&perp_state, &spot_state)
                 .map_err(|e| Error::decode(e.to_string()))?;
 
         Ok(AccountState::new(
