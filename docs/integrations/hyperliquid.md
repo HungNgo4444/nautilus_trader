@@ -332,13 +332,17 @@ instruments = await client.load_instrument_definitions(
 ### Open-order and position reconciliation
 
 Open‑order and position reconciliation covers standard perpetuals and every HIP‑3 dex represented by
-the execution client's cached perpetual instruments, without separate reconciliation configuration.
-A `LiveNode` initializes this cache from the instrument universe when the execution client connects.
-Direct `HyperliquidHttpClient` callers get the same coverage for the instruments they add with
-`cache_instrument()`.
+the execution client's cached perpetual instruments by default. A `LiveNode` initializes this cache
+from the instrument universe when the execution client connects. Direct `HyperliquidHttpClient`
+callers get the same coverage for the instruments they add with `cache_instrument()`.
 
 An unfiltered request queries the default perp dex and each cached builder dex, then combines their
-reports; position reconciliation also includes spot holdings. For perpetual filters, a request
+reports; position reconciliation also includes spot holdings. Each builder dex costs two info
+requests (open orders and clearinghouse state), issued sequentially against the shared rate limit,
+so a venue listing several hundred builder dexes can take minutes to reconcile. Set
+`reconciliation_dexs` on `HyperliquidExecClientConfig` to the builder dex names you trade to limit
+the unfiltered walk to those dexes; an empty list queries only the default perp dex. The default
+dex is always queried, and filtered requests are unaffected. For perpetual filters, a request
 filtered to a HIP‑3 instrument derives the builder dex from the symbol's dex prefix and queries only
 that dex. A standard perpetual filter queries only the default dex. Spot and outcome position filters
 keep their existing spot‑only routing. If any required request fails, reconciliation returns an error

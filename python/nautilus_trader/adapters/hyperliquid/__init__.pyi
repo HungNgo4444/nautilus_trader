@@ -150,6 +150,8 @@ class HyperliquidExecClientConfig:
     def ws_post_timeout_secs(self) -> int: ...
     @property
     def transport_backend(self) -> network.TransportBackend: ...
+    @property
+    def reconciliation_dexs(self) -> list[str] | None: ...
     def __init__(
         self,
         private_key: str | None = None,
@@ -169,6 +171,7 @@ class HyperliquidExecClientConfig:
         include_builder_attribution: bool | None = None,
         ws_post_timeout_secs: int | None = None,
         transport_backend: network.TransportBackend | None = None,
+        reconciliation_dexs: typing.Sequence[str] | None = None,
     ) -> None: ...
     @property
     def has_proxy_url(self) -> bool: ...

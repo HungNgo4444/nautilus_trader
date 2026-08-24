@@ -275,6 +275,13 @@ pub struct HyperliquidExecClientConfig {
     /// when the venue fill stream is unavailable.
     #[builder(default = 0)]
     pub outcome_settlement_poll_secs: u64,
+    /// Builder-deployed (HIP-3) dexes included in unfiltered open-order and
+    /// position reconciliation, by dex name.
+    ///
+    /// `None` queries every builder dex represented by the cached perpetual
+    /// instruments; an empty list queries only the default perp dex. The default
+    /// dex is always queried.
+    pub reconciliation_dexs: Option<Vec<String>>,
 }
 
 #[cfg(feature = "python")]
@@ -294,6 +301,7 @@ nautilus_core::impl_pyo3_config_getters!(HyperliquidExecClientConfig {
     include_builder_attribution: bool,
     ws_post_timeout_secs: u64,
     transport_backend: TransportBackend,
+    reconciliation_dexs: Option<Vec<String>>,
 });
 
 impl Default for HyperliquidExecClientConfig {

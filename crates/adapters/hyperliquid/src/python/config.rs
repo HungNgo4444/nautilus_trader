@@ -130,6 +130,7 @@ impl HyperliquidExecClientConfig {
         include_builder_attribution = None,
         ws_post_timeout_secs = None,
         transport_backend = None,
+        reconciliation_dexs = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -150,6 +151,7 @@ impl HyperliquidExecClientConfig {
         include_builder_attribution: Option<bool>,
         ws_post_timeout_secs: Option<u64>,
         transport_backend: Option<TransportBackend>,
+        reconciliation_dexs: Option<Vec<String>>,
     ) -> Self {
         let defaults = Self::default();
         Self {
@@ -174,6 +176,7 @@ impl HyperliquidExecClientConfig {
             ws_post_timeout_secs: ws_post_timeout_secs.unwrap_or(defaults.ws_post_timeout_secs),
             transport_backend: transport_backend.unwrap_or(defaults.transport_backend),
             outcome_settlement_poll_secs: defaults.outcome_settlement_poll_secs,
+            reconciliation_dexs,
         }
     }
 

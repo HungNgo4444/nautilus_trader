@@ -910,6 +910,8 @@ pub struct HyperliquidHttpClient {
     normalize_prices: bool,
     market_order_slippage_bps: u32,
     include_builder_attribution: bool,
+    /// Builder dexes included in unfiltered reconciliation; `None` includes every cached one.
+    reconciliation_dexs: Option<Vec<Ustr>>,
 }
 
 impl Default for HyperliquidHttpClient {
@@ -963,6 +965,7 @@ impl HyperliquidHttpClient {
             normalize_prices: true,
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
             include_builder_attribution: true,
+            reconciliation_dexs: None,
         }
     }
 
@@ -1081,6 +1084,7 @@ impl HyperliquidHttpClient {
             normalize_prices: true,
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
             include_builder_attribution: true,
+            reconciliation_dexs: None,
         })
     }
 
@@ -1159,6 +1163,7 @@ impl HyperliquidHttpClient {
                     normalize_prices: true,
                     market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
                     include_builder_attribution: true,
+                    reconciliation_dexs: None,
                 })
             }
             None => {
@@ -1203,6 +1208,7 @@ impl HyperliquidHttpClient {
             normalize_prices: true,
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
             include_builder_attribution: true,
+            reconciliation_dexs: None,
         })
     }
 
@@ -1243,6 +1249,15 @@ impl HyperliquidHttpClient {
     /// Sets whether eligible mainnet orders include builder attribution.
     pub fn set_include_builder_attribution(&mut self, value: bool) {
         self.include_builder_attribution = value;
+    }
+
+    /// Sets the builder dexes included in unfiltered reconciliation.
+    ///
+    /// `None` includes every builder dex represented by the cached perpetual
+    /// instruments; an empty list limits reconciliation to the default perp dex.
+    pub fn set_reconciliation_dexs(&mut self, dexs: Option<Vec<String>>) {
+        self.reconciliation_dexs =
+            dexs.map(|dexs| dexs.iter().map(|dex| Ustr::from(dex)).collect());
     }
 
     /// Gets the user address derived from the private key (if client has credentials).
@@ -3568,6 +3583,11 @@ impl HyperliquidHttpClient {
         let mut builder_dexs = cached
             .keys()
             .filter_map(|symbol| perp_dex_from_symbol(symbol.as_str()))
+            .filter(|dex| {
+                self.reconciliation_dexs
+                    .as_ref()
+                    .is_none_or(|allowed| allowed.contains(dex))
+            })
             .collect::<Vec<_>>();
         builder_dexs.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
         builder_dexs.dedup();
@@ -4452,5 +4472,78 @@ mod tests {
             )
             .expect("get_or_create_instrument must resolve sanitized base for HIP-3");
         assert_eq!(resolved.id(), hip3.id());
+    }
+
+    fn cache_perp(client: &HyperliquidHttpClient, symbol: &str) {
+        let raw_symbol = symbol.trim_end_matches("-USD-PERP");
+        let base = Currency::new(raw_symbol, 8, 0, raw_symbol, CurrencyType::Crypto);
+        let usd = Currency::new("USD", 8, 0, "USD", CurrencyType::Crypto);
+        let usdc = Currency::new("USDC", 6, 0, "USDC", CurrencyType::Crypto);
+        let ts = get_atomic_clock_realtime().get_time_ns();
+
+        let perp = InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
+            InstrumentId::new(Symbol::new(symbol), *HYPERLIQUID_VENUE),
+            Symbol::new(raw_symbol),
+            base,
+            usd,
+            usdc,
+            false,
+            5,
+            2,
+            Price::from("0.00001"),
+            Quantity::from("0.01"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            ts,
+            ts,
+        ));
+        client.cache_instrument(&perp);
+    }
+
+    #[rstest]
+    fn test_reconciliation_dexes_follow_the_configured_allowlist() {
+        let mut client =
+            HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+        cache_perp(&client, "BTC-USD-PERP");
+        cache_perp(&client, "xyz:TSLA-USD-PERP");
+        cache_perp(&client, "abc:GOLD-USD-PERP");
+
+        assert_eq!(
+            client.reconciliation_dexes(None),
+            vec![None, Some(Ustr::from("abc")), Some(Ustr::from("xyz"))],
+        );
+
+        client.set_reconciliation_dexs(Some(vec!["xyz".to_string()]));
+        assert_eq!(
+            client.reconciliation_dexes(None),
+            vec![None, Some(Ustr::from("xyz"))],
+        );
+
+        client.set_reconciliation_dexs(Some(Vec::new()));
+        assert_eq!(client.reconciliation_dexes(None), vec![None]);
+
+        let filtered = InstrumentId::new(Symbol::new("abc:GOLD-USD-PERP"), *HYPERLIQUID_VENUE);
+        assert_eq!(
+            client.reconciliation_dexes(Some(filtered)),
+            vec![Some(Ustr::from("abc"))],
+        );
+
+        client.set_reconciliation_dexs(None);
+        assert_eq!(
+            client.reconciliation_dexes(None),
+            vec![None, Some(Ustr::from("abc")), Some(Ustr::from("xyz"))],
+        );
     }
 }
