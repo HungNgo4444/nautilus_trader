@@ -968,16 +968,19 @@ pub fn parse_account_balances_and_margins(
 /// The perp parser already reflects combined USDC when its cross-margin summary
 /// carries collateral or margin state, so this helper appends only non-USDC spot
 /// tokens in that case. If the perp state has no margin summary, or the summary
-/// is present but zeroed, spot USDC is used verbatim.
+/// is present but zeroed, spot USDC is used verbatim. Builder-dex (HIP-3)
+/// clearinghouse states are separate collateral pools: their balances are added
+/// per currency on top of the unified set, and their margins appended.
 ///
 /// # Errors
 ///
 /// Returns an error if any balance conversion fails.
 pub fn parse_combined_account_balances_and_margins(
     perp_state: &ClearinghouseState,
+    builder_states: &[ClearinghouseState],
     spot_state: &SpotClearinghouseState,
 ) -> anyhow::Result<(Vec<AccountBalance>, Vec<MarginBalance>)> {
-    let (mut balances, margins) = parse_account_balances_and_margins(perp_state)?;
+    let (mut balances, mut margins) = parse_account_balances_and_margins(perp_state)?;
 
     let perp_reflects_usdc = perp_state
         .cross_margin_summary
@@ -1002,7 +1005,38 @@ pub fn parse_combined_account_balances_and_margins(
         balances.push(balance);
     }
 
+    // Builder-dex (HIP-3) clearinghouses hold separate per-dex collateral the
+    // default summary never reflects: each one's balances are added per
+    // currency and its margins appended.
+    for state in builder_states {
+        let (builder_balances, builder_margins) = parse_account_balances_and_margins(state)?;
+        merge_added_balances(&mut balances, builder_balances)?;
+        margins.extend(builder_margins);
+    }
+
     Ok((balances, margins))
+}
+
+fn merge_added_balances(
+    held: &mut Vec<AccountBalance>,
+    incoming: Vec<AccountBalance>,
+) -> anyhow::Result<()> {
+    for balance in incoming {
+        match held
+            .iter_mut()
+            .find(|existing| existing.currency == balance.currency)
+        {
+            Some(existing) => {
+                *existing = AccountBalance::from_total_and_free(
+                    existing.total.as_decimal() + balance.total.as_decimal(),
+                    existing.free.as_decimal() + balance.free.as_decimal(),
+                    balance.currency,
+                )?;
+            }
+            None => held.push(balance),
+        }
+    }
+    Ok(())
 }
 
 /// Parses Hyperliquid spot clearinghouse state into Nautilus account balances.
@@ -2213,7 +2247,7 @@ mod tests {
         let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
 
         let (balances, margins) =
-            parse_combined_account_balances_and_margins(&perp_state, &spot_state).unwrap();
+            parse_combined_account_balances_and_margins(&perp_state, &[], &spot_state).unwrap();
 
         assert!(margins.is_empty());
         assert_eq!(balances.len(), 2);
@@ -2247,7 +2281,7 @@ mod tests {
         let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
 
         let (balances, margins) =
-            parse_combined_account_balances_and_margins(&perp_state, &spot_state).unwrap();
+            parse_combined_account_balances_and_margins(&perp_state, &[], &spot_state).unwrap();
 
         assert!(margins.is_empty());
         assert_eq!(balances.len(), 2);
@@ -2282,7 +2316,7 @@ mod tests {
         let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
 
         let (balances, margins) =
-            parse_combined_account_balances_and_margins(&perp_state, &spot_state).unwrap();
+            parse_combined_account_balances_and_margins(&perp_state, &[], &spot_state).unwrap();
 
         assert!(margins.is_empty());
         assert_eq!(balances.len(), 2);
@@ -2316,7 +2350,7 @@ mod tests {
         let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
 
         let (balances, margins) =
-            parse_combined_account_balances_and_margins(&perp_state, &spot_state).unwrap();
+            parse_combined_account_balances_and_margins(&perp_state, &[], &spot_state).unwrap();
 
         assert!(margins.is_empty());
         assert_eq!(balances.len(), 2);
@@ -2350,7 +2384,7 @@ mod tests {
         let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
 
         let (balances, margins) =
-            parse_combined_account_balances_and_margins(&perp_state, &spot_state).unwrap();
+            parse_combined_account_balances_and_margins(&perp_state, &[], &spot_state).unwrap();
 
         assert_eq!(margins.len(), 1);
         assert_eq!(balances.len(), 2);
@@ -2384,7 +2418,7 @@ mod tests {
         let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
 
         let (balances, margins) =
-            parse_combined_account_balances_and_margins(&perp_state, &spot_state).unwrap();
+            parse_combined_account_balances_and_margins(&perp_state, &[], &spot_state).unwrap();
 
         assert!(margins.is_empty());
         assert_eq!(balances.len(), 2);
@@ -2393,6 +2427,124 @@ mod tests {
         assert_eq!(balances[0].free.as_decimal(), dec!(50));
         assert_eq!(balances[1].currency.code.as_str(), "PURR");
         assert_eq!(balances[1].total.as_decimal(), dec!(10));
+    }
+
+    #[rstest]
+    fn test_parse_combined_adds_builder_dex_collateral() {
+        let perp_json = r#"{
+            "assetPositions": [],
+            "crossMarginSummary": {
+                "accountValue": "0",
+                "totalNtlPos": "0",
+                "totalRawUsd": "0",
+                "totalMarginUsed": "0",
+                "withdrawable": "0"
+            },
+            "withdrawable": "0"
+        }"#;
+        let perp_state: ClearinghouseState = serde_json::from_str(perp_json).unwrap();
+
+        let builder_json = r#"{
+            "assetPositions": [],
+            "crossMarginSummary": {
+                "accountValue": "359.81",
+                "totalNtlPos": "0",
+                "totalRawUsd": "359.81",
+                "totalMarginUsed": "0",
+                "withdrawable": "359.81"
+            },
+            "withdrawable": "359.81"
+        }"#;
+        let builder_state: ClearinghouseState = serde_json::from_str(builder_json).unwrap();
+
+        let spot_json = r#"{
+            "balances": [
+                {"coin": "USDC", "token": 0, "total": "25", "hold": "0", "entryNtl": "0"}
+            ]
+        }"#;
+        let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
+
+        let (balances, margins) = parse_combined_account_balances_and_margins(
+            &perp_state,
+            std::slice::from_ref(&builder_state),
+            &spot_state,
+        )
+        .unwrap();
+
+        assert!(margins.is_empty());
+        assert_eq!(balances.len(), 1);
+        assert_eq!(balances[0].currency.code.as_str(), "USDC");
+        assert_eq!(balances[0].total.as_decimal(), dec!(384.81));
+        assert_eq!(balances[0].free.as_decimal(), dec!(384.81));
+    }
+
+    #[rstest]
+    fn test_parse_combined_builder_adds_to_a_reflected_perp_summary() {
+        let perp_json = r#"{
+            "assetPositions": [],
+            "crossMarginSummary": {
+                "accountValue": "500",
+                "totalNtlPos": "0",
+                "totalRawUsd": "500",
+                "totalMarginUsed": "0",
+                "withdrawable": "500"
+            },
+            "withdrawable": "500"
+        }"#;
+        let perp_state: ClearinghouseState = serde_json::from_str(perp_json).unwrap();
+
+        let builder_json = r#"{
+            "assetPositions": [],
+            "crossMarginSummary": {
+                "accountValue": "100",
+                "totalNtlPos": "0",
+                "totalRawUsd": "100",
+                "totalMarginUsed": "40",
+                "withdrawable": "60"
+            },
+            "withdrawable": "60"
+        }"#;
+        let builder_state: ClearinghouseState = serde_json::from_str(builder_json).unwrap();
+
+        let spot_json = r#"{
+            "balances": [
+                {"coin": "USDC", "token": 0, "total": "123", "hold": "0", "entryNtl": "0"},
+                {"coin": "PURR", "token": 1, "total": "10", "hold": "0", "entryNtl": "5"}
+            ]
+        }"#;
+        let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
+
+        let (balances, margins) = parse_combined_account_balances_and_margins(
+            &perp_state,
+            std::slice::from_ref(&builder_state),
+            &spot_state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            margins.len(),
+            1,
+            "the builder dex's reserved margin rides along"
+        );
+        assert_eq!(balances.len(), 2);
+        assert_eq!(balances[0].currency.code.as_str(), "USDC");
+        assert_eq!(balances[0].total.as_decimal(), dec!(600));
+        assert_eq!(balances[0].free.as_decimal(), dec!(560));
+        assert_eq!(balances[1].currency.code.as_str(), "PURR");
+        assert_eq!(balances[1].total.as_decimal(), dec!(10));
+    }
+
+    #[rstest]
+    fn test_parse_combined_empty_builder_slice_changes_nothing() {
+        let perp_json = r#"{"assetPositions": []}"#;
+        let perp_state: ClearinghouseState = serde_json::from_str(perp_json).unwrap();
+        let spot_state = SpotClearinghouseState::default();
+
+        let (balances, margins) =
+            parse_combined_account_balances_and_margins(&perp_state, &[], &spot_state).unwrap();
+
+        assert!(balances.is_empty());
+        assert!(margins.is_empty());
     }
 
     #[rstest]
@@ -2408,7 +2560,7 @@ mod tests {
         let spot_state: SpotClearinghouseState = serde_json::from_str(spot_json).unwrap();
 
         let (balances, _) =
-            parse_combined_account_balances_and_margins(&perp_state, &spot_state).unwrap();
+            parse_combined_account_balances_and_margins(&perp_state, &[], &spot_state).unwrap();
 
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].currency.code.as_str(), "USDC");

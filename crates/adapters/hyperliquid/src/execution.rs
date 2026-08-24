@@ -513,19 +513,20 @@ impl HyperliquidExecutionClient {
     async fn refresh_account_state(&self) -> anyhow::Result<()> {
         let account_address = self.get_account_address()?;
 
-        let (perp_state, spot_state) = self
+        let (perp_state, builder_states, spot_state) = self
             .fetch_combined_clearinghouse_state(&account_address)
             .await?;
 
         log::debug!(
-            "Received clearinghouse state: cross_margin_summary={:?}, asset_positions={}, spot_balances={}",
+            "Received clearinghouse state: cross_margin_summary={:?}, asset_positions={}, builder_dexes={}, spot_balances={}",
             perp_state.cross_margin_summary,
             perp_state.asset_positions.len(),
+            builder_states.len(),
             spot_state.balances.len(),
         );
 
         let (balances, margins) =
-            parse_combined_account_balances_and_margins(&perp_state, &spot_state)
+            parse_combined_account_balances_and_margins(&perp_state, &builder_states, &spot_state)
                 .context("failed to parse combined account balances and margins")?;
 
         // Emit even when both sides are empty so the account registers for
@@ -541,7 +542,11 @@ impl HyperliquidExecutionClient {
     async fn fetch_combined_clearinghouse_state(
         &self,
         account_address: &str,
-    ) -> anyhow::Result<(ClearinghouseState, SpotClearinghouseState)> {
+    ) -> anyhow::Result<(
+        ClearinghouseState,
+        Vec<ClearinghouseState>,
+        SpotClearinghouseState,
+    )> {
         let perp_json = self
             .http_client
             .info_clearinghouse_state(account_address)
@@ -549,6 +554,19 @@ impl HyperliquidExecutionClient {
             .context("failed to fetch clearinghouse state")?;
         let perp_state: ClearinghouseState = serde_json::from_value(perp_json)
             .context("failed to deserialize clearinghouse state")?;
+
+        let builder_jsons = self
+            .http_client
+            .info_builder_clearinghouse_states(account_address)
+            .await
+            .context("failed to fetch builder clearinghouse states")?;
+        let mut builder_states = Vec::with_capacity(builder_jsons.len());
+        for builder_json in builder_jsons {
+            builder_states.push(
+                serde_json::from_value(builder_json)
+                    .context("failed to deserialize builder clearinghouse state")?,
+            );
+        }
 
         let spot_json = self
             .http_client
@@ -558,7 +576,7 @@ impl HyperliquidExecutionClient {
         let spot_state: SpotClearinghouseState = serde_json::from_value(spot_json)
             .context("failed to deserialize spot clearinghouse state")?;
 
-        Ok((perp_state, spot_state))
+        Ok((perp_state, builder_states, spot_state))
     }
 
     async fn await_account_registered(&self, timeout_secs: f64) -> anyhow::Result<()> {
@@ -1560,6 +1578,19 @@ impl ExecutionClient for HyperliquidExecutionClient {
             let perp_state: ClearinghouseState = serde_json::from_value(perp_json)
                 .context("failed to deserialize clearinghouse state")?;
 
+            let builder_jsons = http_client
+                .info_builder_clearinghouse_states(&account_address)
+                .await
+                .context("failed to fetch builder clearinghouse states")?;
+            let mut builder_states: Vec<ClearinghouseState> =
+                Vec::with_capacity(builder_jsons.len());
+            for builder_json in builder_jsons {
+                builder_states.push(
+                    serde_json::from_value(builder_json)
+                        .context("failed to deserialize builder clearinghouse state")?,
+                );
+            }
+
             let spot_json = http_client
                 .info_spot_clearinghouse_state(&account_address)
                 .await
@@ -1567,9 +1598,12 @@ impl ExecutionClient for HyperliquidExecutionClient {
             let spot_state: SpotClearinghouseState = serde_json::from_value(spot_json)
                 .context("failed to deserialize spot clearinghouse state")?;
 
-            let (balances, margins) =
-                parse_combined_account_balances_and_margins(&perp_state, &spot_state)
-                    .context("failed to parse combined account balances and margins")?;
+            let (balances, margins) = parse_combined_account_balances_and_margins(
+                &perp_state,
+                &builder_states,
+                &spot_state,
+            )
+            .context("failed to parse combined account balances and margins")?;
             let ts_event = clock.get_time_ns();
             emitter.emit_account_state(balances, margins, true, ts_event, None);
 

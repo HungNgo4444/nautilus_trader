@@ -1834,6 +1834,26 @@ impl HyperliquidHttpClient {
         self.inner.info_clearinghouse_state(user).await
     }
 
+    /// Get clearinghouse state for every builder dex reconciliation covers, in dex order.
+    ///
+    /// Builder-deployed (HIP-3) dexes hold per-dex collateral the default perp
+    /// clearinghouse never reflects.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any dex's request fails.
+    pub async fn info_builder_clearinghouse_states(&self, user: &str) -> Result<Vec<Value>> {
+        let mut states = Vec::new();
+        for dex in self.reconciliation_dexes(None) {
+            let Some(dex) = dex else { continue };
+            states.push(
+                self.info_clearinghouse_state_for_dex(user, Some(dex.as_str()))
+                    .await?,
+            );
+        }
+        Ok(states)
+    }
+
     async fn info_clearinghouse_state_for_dex(
         &self,
         user: &str,
@@ -2769,6 +2789,16 @@ impl HyperliquidHttpClient {
                 Error::bad_request(format!("Failed to parse clearinghouse state: {e}"))
             })?;
 
+        let builder_responses = self.info_builder_clearinghouse_states(user).await?;
+        let mut builder_states: Vec<ClearinghouseState> =
+            Vec::with_capacity(builder_responses.len());
+        for builder_response in builder_responses {
+            builder_states.push(serde_json::from_value(builder_response).map_err(|e| {
+                log::error!("Failed to parse builder clearinghouse state: {e}");
+                Error::bad_request(format!("Failed to parse builder clearinghouse state: {e}"))
+            })?);
+        }
+
         // Spot must not be silently dropped: a 429 or parse error would
         // otherwise make non-USDC holdings look like they vanished.
         let spot_response = self.info_spot_clearinghouse_state(user).await?;
@@ -2780,7 +2810,7 @@ impl HyperliquidHttpClient {
             })?;
 
         let (balances, margins) =
-            parse_combined_account_balances_and_margins(&perp_state, &spot_state)
+            parse_combined_account_balances_and_margins(&perp_state, &builder_states, &spot_state)
                 .map_err(|e| Error::decode(e.to_string()))?;
 
         Ok(AccountState::new(
