@@ -682,7 +682,9 @@ impl OKXWebSocketClient {
                                 inst_id: Some(*inst_id),
                             };
 
-                            if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe { args: vec![arg] }) {
+                            if let Err(e) = cmd_tx_for_reconnect
+                                .send(HandlerCommand::Subscribe { args: vec![arg] })
+                            {
                                 log::error!("Failed to send resubscribe command: error={e}");
                             }
                         }
@@ -697,7 +699,9 @@ impl OKXWebSocketClient {
                             inst_id: None,
                         };
 
-                        if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe { args: vec![arg] }) {
+                        if let Err(e) =
+                            cmd_tx_for_reconnect.send(HandlerCommand::Subscribe { args: vec![arg] })
+                        {
                             log::error!("Failed to send resubscribe command: error={e}");
                         }
                     }
@@ -712,7 +716,9 @@ impl OKXWebSocketClient {
                                 inst_id: None,
                             };
 
-                            if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe { args: vec![arg] }) {
+                            if let Err(e) = cmd_tx_for_reconnect
+                                .send(HandlerCommand::Subscribe { args: vec![arg] })
+                            {
                                 log::error!("Failed to send resubscribe command: error={e}");
                             }
                         }
@@ -728,7 +734,9 @@ impl OKXWebSocketClient {
                                 inst_id: None,
                             };
 
-                            if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Subscribe { args: vec![arg] }) {
+                            if let Err(e) = cmd_tx_for_reconnect
+                                .send(HandlerCommand::Subscribe { args: vec![arg] })
+                            {
                                 log::error!("Failed to send resubscribe command: error={e}");
                             }
                         }
@@ -744,30 +752,7 @@ impl OKXWebSocketClient {
 
                             has_reconnected = true;
 
-                            // Mark all confirmed subscriptions as failed so they transition to pending state
-                            let confirmed_topics_vec: Vec<String> = {
-                                let confirmed = subscriptions_state.confirmed();
-                                let mut topics = Vec::new();
-
-                                for entry in confirmed.iter() {
-                                    let channel = entry.key();
-                                    for symbol in entry.value() {
-                                        if symbol.as_str() == "#" {
-                                            topics.push(channel.to_string());
-                                        } else {
-                                            topics.push(format!("{channel}{OKX_WS_TOPIC_DELIMITER}{symbol}"));
-                                        }
-                                    }
-                                }
-                                topics
-                            };
-
-                            if !confirmed_topics_vec.is_empty() {
-                                log::debug!("Marking confirmed subscriptions as pending for replay: count={}", confirmed_topics_vec.len());
-                                for topic in confirmed_topics_vec {
-                                    subscriptions_state.mark_failure(&topic);
-                                }
-                            }
+                            subscriptions_state.reset_after_reconnect();
 
                             if let Some(cred) = &credential {
                                 log::debug!("Re-authenticating after reconnection");
@@ -776,7 +761,8 @@ impl OKXWebSocketClient {
                                     .expect("System time should be after UNIX epoch")
                                     .as_secs()
                                     .to_string();
-                                let signature = cred.sign(&timestamp, "GET", "/users/self/verify", "");
+                                let signature =
+                                    cred.sign(&timestamp, "GET", "/users/self/verify", "");
 
                                 let auth_message = super::messages::OKXAuthentication {
                                     op: "login",
@@ -789,8 +775,12 @@ impl OKXWebSocketClient {
                                 };
 
                                 if let Ok(payload) = serde_json::to_string(&auth_message) {
-                                    if let Err(e) = cmd_tx_for_reconnect.send(HandlerCommand::Authenticate { payload }) {
-                                        log::error!("Failed to send reconnection auth command: error={e}");
+                                    if let Err(e) = cmd_tx_for_reconnect
+                                        .send(HandlerCommand::Authenticate { payload })
+                                    {
+                                        log::error!(
+                                            "Failed to send reconnection auth command: error={e}"
+                                        );
                                     }
                                 } else {
                                     log::error!("Failed to serialize reconnection auth message");
@@ -800,7 +790,9 @@ impl OKXWebSocketClient {
                             // Unauthenticated sessions resubscribe immediately after reconnection,
                             // authenticated sessions wait for Authenticated message
                             if credential.is_none() {
-                                log::debug!("No authentication required, resubscribing immediately");
+                                log::debug!(
+                                    "No authentication required, resubscribing immediately"
+                                );
                                 resubscribe_all();
                             }
 
@@ -823,9 +815,7 @@ impl OKXWebSocketClient {
                         }
                         None => {
                             if handler.is_stopped() {
-                                log::debug!(
-                                    "Stop signal received, ending message processing",
-                                );
+                                log::debug!("Stop signal received, ending message processing",);
                                 break;
                             }
                             log::debug!("WebSocket stream closed");
