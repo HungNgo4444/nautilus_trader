@@ -383,6 +383,19 @@ pub fn parse_spot_instrument(
         "margin_trading".to_string(),
         serde_json::Value::Bool(margin_trading_supported),
     );
+    if let Some(symbol_type) = definition.symbol_type {
+        info.insert(
+            "symbol_type".to_string(),
+            serde_json::to_value(symbol_type)
+                .expect("BybitSymbolType serializes infallibly to a string"),
+        );
+    }
+    if let Some(xstock_multiplier) = &definition.xstock_multiplier {
+        info.insert(
+            "xstock_multiplier".to_string(),
+            serde_json::Value::String(xstock_multiplier.clone()),
+        );
+    }
 
     let instrument = CurrencyPair::new(
         instrument_id,
@@ -2027,6 +2040,42 @@ mod tests {
                     pair.info.as_ref().unwrap().get_bool("margin_trading"),
                     Some(expected)
                 );
+            }
+            _ => panic!("expected CurrencyPair"),
+        }
+    }
+
+    #[rstest]
+    fn parse_spot_instrument_forwards_xstock_symbol_type() {
+        let json = load_test_json("http_get_instruments_spot_xstocks.json");
+        let response: BybitInstrumentSpotResponse = serde_json::from_str(&json).unwrap();
+        let instrument = &response.result.list[0];
+        let fee_rate = sample_fee_rate("AAPLUSDT", "0.0006", "0.0001", Some("AAPL"));
+
+        let parsed = parse_spot_instrument(instrument, &fee_rate, TS, TS).unwrap();
+        match parsed {
+            InstrumentAny::CurrencyPair(pair) => {
+                let info = pair.info.as_ref().unwrap();
+                assert_eq!(info.get_str("symbol_type"), Some("xstocks"));
+                assert_eq!(info.get_str("xstock_multiplier"), Some("0.1"));
+            }
+            _ => panic!("expected CurrencyPair"),
+        }
+    }
+
+    #[rstest]
+    fn parse_spot_instrument_omits_symbol_type_when_absent() {
+        let json = load_test_json("http_get_instruments_spot.json");
+        let response: BybitInstrumentSpotResponse = serde_json::from_str(&json).unwrap();
+        let instrument = &response.result.list[0];
+        let fee_rate = sample_fee_rate("BTCUSDT", "0.0006", "0.0001", Some("BTC"));
+
+        let parsed = parse_spot_instrument(instrument, &fee_rate, TS, TS).unwrap();
+        match parsed {
+            InstrumentAny::CurrencyPair(pair) => {
+                let info = pair.info.as_ref().unwrap();
+                assert_eq!(info.get_str("symbol_type"), None);
+                assert_eq!(info.get_str("xstock_multiplier"), None);
             }
             _ => panic!("expected CurrencyPair"),
         }
