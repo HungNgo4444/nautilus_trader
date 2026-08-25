@@ -156,6 +156,9 @@ mod tests {
 
         assert!(stream.nodelay().unwrap());
         assert!(socket.keepalive().unwrap());
+
+        // WHY: socket2 only exposes a `TCP_KEEPIDLE` getter on Unix; Windows has no equivalent.
+        #[cfg(not(windows))]
         assert_eq!(socket.tcp_keepalive_time().unwrap(), KEEPALIVE_TIME);
 
         #[cfg(target_os = "linux")]
