@@ -65,6 +65,8 @@ struct TestServerState {
     order_status_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     clearinghouse_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     clearinghouse_dex_responses: Arc<tokio::sync::Mutex<HashMap<String, Value>>>,
+    user_fills_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    historical_orders_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     spot_fails: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -79,6 +81,8 @@ impl Default for TestServerState {
             order_status_response: Arc::new(tokio::sync::Mutex::new(None)),
             clearinghouse_response: Arc::new(tokio::sync::Mutex::new(None)),
             clearinghouse_dex_responses: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            user_fills_response: Arc::new(tokio::sync::Mutex::new(None)),
+            historical_orders_response: Arc::new(tokio::sync::Mutex::new(None)),
             spot_fails: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
@@ -182,7 +186,14 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
             let book = load_json("http_l2_book_btc.json");
             Json(book).into_response()
         }
-        "userFills" => Json(json!([])).into_response(),
+        "userFills" => {
+            let custom = state.user_fills_response.lock().await;
+            Json(custom.clone().unwrap_or(json!([]))).into_response()
+        }
+        "historicalOrders" => {
+            let custom = state.historical_orders_response.lock().await;
+            Json(custom.clone().unwrap_or(json!([]))).into_response()
+        }
         "orderStatus" => {
             let custom = state.order_status_response.lock().await;
             Json(custom.clone().unwrap_or(json!({"statuses": []}))).into_response()
@@ -1522,8 +1533,63 @@ fn create_domain_client(addr: &SocketAddr) -> HyperliquidHttpClient {
     client
 }
 
+/// A default session that explicitly opted into the wallet's builder dexes.
+///
+/// Reconciling another collateral pool is opt-in: without this a default
+/// session sweeps the default pool alone.
+fn create_multi_pool_client(addr: &SocketAddr) -> HyperliquidHttpClient {
+    let mut client = create_domain_client(addr);
+    client.set_reconciliation_dexs(Some(vec!["flx".to_string(), "xyz".to_string()]));
+    client
+}
+
+/// A session pinned to one builder (HIP-3) collateral pool.
+fn create_pinned_client(addr: &SocketAddr, account_dex: &str) -> HyperliquidHttpClient {
+    let mut client = create_domain_client(addr);
+    client.set_account_dex(Some(account_dex.to_string()));
+    client
+}
+
 fn cache_btc_instrument(client: &HyperliquidHttpClient) {
     cache_perp_instrument(client, "BTC-USD-PERP.HYPERLIQUID", "BTC");
+}
+
+fn cache_spot_instrument(client: &HyperliquidHttpClient, instrument_id: &str, base: &str) {
+    use nautilus_model::{
+        enums::CurrencyType,
+        identifiers::{InstrumentId, Symbol},
+        instruments::{CurrencyPair, InstrumentAny},
+        types::{Currency, Price, Quantity},
+    };
+
+    let ts = nautilus_core::time::get_atomic_clock_realtime().get_time_ns();
+    let instrument = CurrencyPair::new(
+        InstrumentId::from(instrument_id),
+        Symbol::new(format!("{base}/USDC")),
+        Currency::new(base, 8, 0, base, CurrencyType::Crypto),
+        Currency::new("USDC", 6, 0, "USDC", CurrencyType::Crypto),
+        5,
+        0,
+        Price::from("0.00001"),
+        Quantity::from("1"),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        ts,
+        ts,
+    );
+    client.cache_instrument(&InstrumentAny::CurrencyPair(instrument));
 }
 
 fn cache_xyz_instrument(client: &HyperliquidHttpClient) {
@@ -1650,6 +1716,604 @@ async fn configure_position_responses(state: &TestServerState) {
     ]);
 }
 
+fn user_fill(coin: &str, oid: u64, tid: u64) -> Value {
+    json!({
+        "coin": coin,
+        "px": "95000.0",
+        "sz": "0.10000",
+        "side": "B",
+        "time": 1_700_000_000_000u64,
+        "startPosition": "0.0",
+        "dir": "Open Long",
+        "closedPnl": "0.0",
+        "hash": "0xfeed",
+        "oid": oid,
+        "crossed": true,
+        "fee": "0.1",
+        "tid": tid,
+        "feeToken": "USDC",
+        "twapId": null
+    })
+}
+
+async fn configure_user_fills_response(state: &TestServerState) {
+    *state.user_fills_response.lock().await = Some(json!([
+        user_fill("BTC", 1001, 11),
+        user_fill("flx:TEST", 2002, 22),
+        user_fill("xyz:XYZ100", 3003, 33),
+    ]));
+}
+
+fn historical_order(coin: &str, oid: u64) -> Value {
+    json!({
+        "order": {
+            "coin": coin,
+            "side": "B",
+            "limitPx": "95000.0",
+            "sz": "0.0",
+            "oid": oid,
+            "timestamp": 1_700_000_000_000u64,
+            "origSz": "0.10000",
+            "cloid": null,
+            "tif": "Gtc",
+            "reduceOnly": false
+        },
+        "status": "filled",
+        "statusTimestamp": 1_700_000_000_000u64
+    })
+}
+
+async fn configure_historical_orders_response(state: &TestServerState) {
+    *state.historical_orders_response.lock().await = Some(json!([
+        historical_order("BTC", 1001),
+        historical_order("flx:TEST", 2002),
+        historical_order("xyz:XYZ100", 3003),
+    ]));
+}
+
+/// A venue that answers every dex query with every pool's orders.
+///
+/// Routing the request per dex is not on its own proof of isolation, so the
+/// coin filter is exercised against a server that never narrows anything.
+async fn configure_mixed_open_orders_for_every_dex(state: &TestServerState) {
+    let mixed = json!([
+        open_order("BTC", 1001, "95000.0", "0.10000"),
+        open_order("flx:TEST", 2002, "100.0", "0.20000"),
+        open_order("xyz:XYZ100", 3003, "25000.0", "0.30000"),
+    ]);
+    *state.frontend_open_orders_response.lock().await = Some(mixed.clone());
+    *state.frontend_open_orders_dex_responses.lock().await = HashMap::from([
+        ("flx".to_string(), mixed.clone()),
+        ("xyz".to_string(), mixed),
+    ]);
+}
+
+/// A venue that answers every dex query with every pool's positions.
+async fn configure_mixed_positions_for_every_dex(state: &TestServerState) {
+    let mixed = json!({
+        "assetPositions": [
+            clearinghouse_position("BTC", "0.10000", "95000.0")["assetPositions"][0].clone(),
+            clearinghouse_position("flx:TEST", "0.20000", "100.0")["assetPositions"][0].clone(),
+            clearinghouse_position("xyz:XYZ100", "-0.30000", "25000.0")["assetPositions"][0]
+                .clone(),
+        ]
+    });
+    *state.clearinghouse_response.lock().await = Some(mixed.clone());
+    *state.clearinghouse_dex_responses.lock().await = HashMap::from([
+        ("flx".to_string(), mixed.clone()),
+        ("xyz".to_string(), mixed),
+    ]);
+}
+
+fn report_instrument_ids<T, F>(reports: &[T], id_of: F) -> Vec<String>
+where
+    F: Fn(&T) -> InstrumentId,
+{
+    reports.iter().map(|r| id_of(r).to_string()).collect()
+}
+
+// The {account_dex} x {fill coin pool} matrix: `userFills` covers the whole
+// wallet, so each session keeps its own pool's fills and drops the rest.
+#[rstest]
+#[case(None, &["BTC-USD-PERP.HYPERLIQUID"])]
+#[case(Some("flx"), &["flx:TEST-USD-PERP.HYPERLIQUID"])]
+#[case(Some("xyz"), &["xyz:XYZ100-USD-PERP.HYPERLIQUID"])]
+#[tokio::test]
+async fn test_request_fill_reports_keeps_only_the_owned_pool(
+    #[case] account_dex: Option<&str>,
+    #[case] expected: &[&str],
+) {
+    let state = TestServerState::default();
+    configure_user_fills_response(&state).await;
+    let addr = start_mock_server(state).await;
+
+    let client = match account_dex {
+        Some(dex) => create_pinned_client(&addr, dex),
+        None => create_domain_client(&addr),
+    };
+    cache_reconciliation_perps(&client);
+
+    let reports = client.request_fill_reports("0xuser", None).await.unwrap();
+
+    assert_eq!(
+        report_instrument_ids(&reports, |r| r.instrument_id),
+        expected,
+    );
+}
+
+// `historicalOrders` has no dex parameter at all, so the coin filter is the
+// only thing keeping one session's history out of the other's.
+#[rstest]
+#[case(None, &["BTC-USD-PERP.HYPERLIQUID"])]
+#[case(Some("flx"), &["flx:TEST-USD-PERP.HYPERLIQUID"])]
+#[case(Some("xyz"), &["xyz:XYZ100-USD-PERP.HYPERLIQUID"])]
+#[tokio::test]
+async fn test_request_historical_order_status_reports_keep_only_the_owned_pool(
+    #[case] account_dex: Option<&str>,
+    #[case] expected: &[&str],
+) {
+    let state = TestServerState::default();
+    configure_historical_orders_response(&state).await;
+    let addr = start_mock_server(state).await;
+
+    let client = match account_dex {
+        Some(dex) => create_pinned_client(&addr, dex),
+        None => create_domain_client(&addr),
+    };
+    cache_reconciliation_perps(&client);
+
+    let reports = client
+        .request_historical_order_status_reports("0xuser", None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report_instrument_ids(&reports, |r| r.instrument_id),
+        expected,
+    );
+}
+
+#[rstest]
+#[case(None, &["BTC-USD-PERP.HYPERLIQUID"])]
+#[case(Some("flx"), &["flx:TEST-USD-PERP.HYPERLIQUID"])]
+#[case(Some("xyz"), &["xyz:XYZ100-USD-PERP.HYPERLIQUID"])]
+#[tokio::test]
+async fn test_request_order_status_reports_keep_only_the_owned_pool(
+    #[case] account_dex: Option<&str>,
+    #[case] expected: &[&str],
+) {
+    let state = TestServerState::default();
+    configure_mixed_open_orders_for_every_dex(&state).await;
+    let addr = start_mock_server(state).await;
+
+    let client = match account_dex {
+        Some(dex) => create_pinned_client(&addr, dex),
+        None => create_domain_client(&addr),
+    };
+    cache_reconciliation_perps(&client);
+
+    let reports = client
+        .request_order_status_reports("0xuser", None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report_instrument_ids(&reports, |r| r.instrument_id),
+        expected,
+    );
+}
+
+// Spot settles in the default pool, so a pinned session reports its own perp
+// positions alone while the default session keeps spot.
+#[rstest]
+#[case(
+    None,
+    &[
+        "BTC-USD-PERP.HYPERLIQUID",
+        "PURR-USDC-SPOT.HYPERLIQUID",
+        "HYPE-USDC-SPOT.HYPERLIQUID",
+    ],
+)]
+#[case(Some("flx"), &["flx:TEST-USD-PERP.HYPERLIQUID"])]
+#[case(Some("xyz"), &["xyz:XYZ100-USD-PERP.HYPERLIQUID"])]
+#[tokio::test]
+async fn test_request_position_status_reports_keep_only_the_owned_pool(
+    #[case] account_dex: Option<&str>,
+    #[case] expected: &[&str],
+) {
+    let state = TestServerState::default();
+    configure_mixed_positions_for_every_dex(&state).await;
+    let addr = start_mock_server(state).await;
+
+    let client = match account_dex {
+        Some(dex) => create_pinned_client(&addr, dex),
+        None => create_domain_client(&addr),
+    };
+    cache_reconciliation_perps(&client);
+    cache_spot_instrument(&client, "PURR-USDC-SPOT.HYPERLIQUID", "PURR");
+    cache_spot_instrument(&client, "HYPE-USDC-SPOT.HYPERLIQUID", "HYPE");
+
+    let reports = client
+        .request_position_status_reports("0xuser", None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report_instrument_ids(&reports, |r| r.instrument_id),
+        expected,
+    );
+}
+
+// Spot belongs to the default session, so a pinned session must not even reach
+// the endpoint: a spot outage is not its problem to propagate.
+#[rstest]
+#[case(None, false)]
+#[case(Some("flx"), true)]
+#[case(Some("xyz"), true)]
+#[tokio::test]
+async fn test_request_position_status_reports_pinned_session_never_reads_spot(
+    #[case] account_dex: Option<&str>,
+    #[case] expect_ok: bool,
+) {
+    let state = TestServerState::default();
+    configure_mixed_positions_for_every_dex(&state).await;
+    state.spot_fails.store(true, Ordering::Relaxed);
+    let addr = start_mock_server(state).await;
+
+    let client = match account_dex {
+        Some(dex) => create_pinned_client(&addr, dex),
+        None => create_domain_client(&addr),
+    };
+    cache_reconciliation_perps(&client);
+
+    let result = client.request_position_status_reports("0xuser", None).await;
+
+    assert_eq!(result.is_ok(), expect_ok);
+}
+
+// A builder dex's open orders never appear on the default `frontendOpenOrders`
+// endpoint, so a pinned session has to ask for its own dex.
+#[rstest]
+#[case("flx", 2002, "flx:TEST-USD-PERP.HYPERLIQUID")]
+#[case("xyz", 3003, "xyz:XYZ100-USD-PERP.HYPERLIQUID")]
+#[tokio::test]
+async fn test_request_order_status_report_reads_the_pinned_dex_open_orders(
+    #[case] account_dex: &str,
+    #[case] oid: u64,
+    #[case] expected: &str,
+) {
+    let state = TestServerState::default();
+    // Per-dex responses: the default endpoint only knows the default pool.
+    configure_open_order_responses(&state).await;
+    *state.order_status_response.lock().await = Some(json!({"status": "unknownOid"}));
+    let addr = start_mock_server(state).await;
+
+    let client = create_pinned_client(&addr, account_dex);
+    cache_reconciliation_perps(&client);
+
+    let report = client
+        .request_order_status_report("0xuser", oid)
+        .await
+        .unwrap()
+        .expect("a pinned session reads its own dex open orders");
+
+    assert_eq!(report.instrument_id.to_string(), expected);
+}
+
+// A spot filter routes past the perp leg entirely, so it needs its own guard.
+#[rstest]
+#[case(None, &["PURR-USDC-SPOT.HYPERLIQUID"])]
+#[case(Some("flx"), &[])]
+#[case(Some("xyz"), &[])]
+#[tokio::test]
+async fn test_request_position_status_reports_spot_filter_belongs_to_the_default_pool(
+    #[case] account_dex: Option<&str>,
+    #[case] expected: &[&str],
+) {
+    let state = TestServerState::default();
+    configure_mixed_positions_for_every_dex(&state).await;
+    let addr = start_mock_server(state).await;
+
+    let client = match account_dex {
+        Some(dex) => create_pinned_client(&addr, dex),
+        None => create_domain_client(&addr),
+    };
+    cache_reconciliation_perps(&client);
+    cache_spot_instrument(&client, "PURR-USDC-SPOT.HYPERLIQUID", "PURR");
+
+    let reports = client
+        .request_position_status_reports("0xuser", Some("PURR-USDC-SPOT.HYPERLIQUID".into()))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report_instrument_ids(&reports, |r| r.instrument_id),
+        expected,
+    );
+}
+
+#[rstest]
+#[case(None, &["PURR-USDC-SPOT.HYPERLIQUID", "HYPE-USDC-SPOT.HYPERLIQUID"])]
+#[case(Some("flx"), &[])]
+#[case(Some("xyz"), &[])]
+#[tokio::test]
+async fn test_request_spot_position_status_reports_belong_to_the_default_pool(
+    #[case] account_dex: Option<&str>,
+    #[case] expected: &[&str],
+) {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+
+    let client = match account_dex {
+        Some(dex) => create_pinned_client(&addr, dex),
+        None => create_domain_client(&addr),
+    };
+    cache_spot_instrument(&client, "PURR-USDC-SPOT.HYPERLIQUID", "PURR");
+    cache_spot_instrument(&client, "HYPE-USDC-SPOT.HYPERLIQUID", "HYPE");
+
+    let reports = client
+        .request_spot_position_status_reports("0xuser", None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report_instrument_ids(&reports, |r| r.instrument_id),
+        expected,
+    );
+}
+
+// An oid or cloid lookup answers for the pool it owns and stays silent about
+// the other session's orders.
+#[rstest]
+#[case(None, Some("BTC-USD-PERP.HYPERLIQUID"))]
+#[case(Some("flx"), Some("flx:TEST-USD-PERP.HYPERLIQUID"))]
+#[case(Some("xyz"), Some("xyz:XYZ100-USD-PERP.HYPERLIQUID"))]
+#[tokio::test]
+async fn test_request_order_status_report_by_oid_keeps_only_the_owned_pool(
+    #[case] account_dex: Option<&str>,
+    #[case] expected: Option<&str>,
+) {
+    let expected_oid = match account_dex {
+        None => 1001,
+        Some("flx") => 2002,
+        _ => 3003,
+    };
+    let state = TestServerState::default();
+    configure_mixed_open_orders_for_every_dex(&state).await;
+    *state.order_status_response.lock().await = Some(json!({"status": "unknownOid"}));
+    let addr = start_mock_server(state).await;
+
+    let client = match account_dex {
+        Some(dex) => create_pinned_client(&addr, dex),
+        None => create_domain_client(&addr),
+    };
+    cache_reconciliation_perps(&client);
+
+    let owned = client
+        .request_order_status_report("0xuser", expected_oid)
+        .await
+        .unwrap();
+    assert_eq!(
+        owned.map(|report| report.instrument_id.to_string()),
+        expected.map(str::to_string),
+    );
+
+    // Every oid the session does not own reads as absent.
+    for foreign_oid in [1001u64, 2002, 3003] {
+        if foreign_oid == expected_oid {
+            continue;
+        }
+        let report = client
+            .request_order_status_report("0xuser", foreign_oid)
+            .await
+            .unwrap();
+        assert!(
+            report.is_none(),
+            "oid {foreign_oid} leaked into the {account_dex:?} session",
+        );
+    }
+}
+
+// The closed-order fallback is keyed by oid alone, so a closed order from the
+// other session's pool must not come back through it either.
+#[rstest]
+#[case(None, false)]
+#[case(Some("flx"), false)]
+#[case(Some("xyz"), true)]
+#[tokio::test]
+async fn test_request_order_status_report_fallback_keeps_only_the_owned_pool(
+    #[case] account_dex: Option<&str>,
+    #[case] expect_report: bool,
+) {
+    let state = TestServerState::default();
+    *state.order_status_response.lock().await = Some(json!({
+        "status": "order",
+        "order": {
+            "order": {
+                "coin": "xyz:XYZ100",
+                "side": "B",
+                "limitPx": "25000.0",
+                "sz": "0.0",
+                "oid": 3003,
+                "timestamp": 1_700_000_000_000u64,
+                "origSz": "0.30000",
+                "cloid": null,
+            },
+            "status": "canceled",
+            "statusTimestamp": 1_700_001_000_000u64
+        }
+    }));
+    let addr = start_mock_server(state).await;
+
+    let client = match account_dex {
+        Some(dex) => create_pinned_client(&addr, dex),
+        None => create_domain_client(&addr),
+    };
+    cache_reconciliation_perps(&client);
+
+    let report = client
+        .request_order_status_report("0xuser", 3003)
+        .await
+        .unwrap();
+
+    assert_eq!(report.is_some(), expect_report);
+}
+
+// The cloid lookup reads open orders too, so it carries the same guard.
+#[rstest]
+#[case(None, false)]
+#[case(Some("flx"), false)]
+#[case(Some("xyz"), true)]
+#[tokio::test]
+async fn test_request_order_status_report_by_cloid_keeps_only_the_owned_pool(
+    #[case] account_dex: Option<&str>,
+    #[case] expect_report: bool,
+) {
+    let coid = ClientOrderId::new("O-20240101-000077");
+    let cloid_hex = Cloid::from_client_order_id(coid).to_hex();
+
+    let state = TestServerState::default();
+    let mut order = open_order("xyz:XYZ100", 3003, "25000.0", "0.30000");
+    order["cloid"] = json!(cloid_hex);
+    let orders = json!([order]);
+    *state.frontend_open_orders_response.lock().await = Some(orders.clone());
+    *state.frontend_open_orders_dex_responses.lock().await = HashMap::from([
+        ("flx".to_string(), orders.clone()),
+        ("xyz".to_string(), orders),
+    ]);
+    let addr = start_mock_server(state).await;
+
+    let client = match account_dex {
+        Some(dex) => create_pinned_client(&addr, dex),
+        None => create_domain_client(&addr),
+    };
+    cache_reconciliation_perps(&client);
+
+    let report = client
+        .request_order_status_report_by_client_order_id("0xuser", &coid)
+        .await
+        .unwrap();
+
+    assert_eq!(report.is_some(), expect_report);
+}
+
+fn clearinghouse_state_with_value(account_value: &str) -> Value {
+    json!({
+        "marginSummary": {
+            "accountValue": account_value,
+            "totalMarginUsed": "0.0",
+            "totalNtlPos": "0.0",
+            "totalRawUsd": account_value
+        },
+        "crossMarginSummary": {
+            "accountValue": account_value,
+            "totalMarginUsed": "0.0",
+            "totalNtlPos": "0.0",
+            "totalRawUsd": account_value
+        },
+        "crossMaintenanceMarginUsed": "0.0",
+        "withdrawable": account_value,
+        "assetPositions": []
+    })
+}
+
+// A builder (HIP-3) dex margins its own collateral, so each session reports the
+// pool it owns and never the other's account value.
+#[rstest]
+#[case(None, 1000.0)]
+#[case(Some("flx"), 2000.0)]
+#[case(Some("xyz"), 3000.0)]
+#[tokio::test]
+async fn test_request_account_state_reads_only_the_owned_pool(
+    #[case] account_dex: Option<&str>,
+    #[case] expected_usdc: f64,
+) {
+    let state = TestServerState::default();
+    *state.clearinghouse_response.lock().await = Some(clearinghouse_state_with_value("1000.0"));
+    *state.clearinghouse_dex_responses.lock().await = HashMap::from([
+        ("flx".to_string(), clearinghouse_state_with_value("2000.0")),
+        ("xyz".to_string(), clearinghouse_state_with_value("3000.0")),
+    ]);
+    // Spot belongs to the default session: a pinned session must never reach it.
+    state.spot_fails.store(true, Ordering::Relaxed);
+    let addr = start_mock_server(state).await;
+
+    let client = match account_dex {
+        Some(dex) => create_pinned_client(&addr, dex),
+        None => create_domain_client(&addr),
+    };
+
+    let result = client.request_account_state("0xuser").await;
+
+    if account_dex.is_none() {
+        assert!(
+            result.is_err(),
+            "a default session reads spot and must surface its failure",
+        );
+        return;
+    }
+
+    let account_state = result.expect("a pinned session reads its dex clearinghouse alone");
+    let usdc = account_state
+        .balances
+        .iter()
+        .find(|balance| balance.currency.code.as_str() == "USDC")
+        .expect("USDC balance");
+    assert_eq!(usdc.total.as_f64(), expected_usdc);
+}
+
+// A wallet that never touched a builder dex reads exactly as it did before the
+// pools existed, whichever knob is set.
+#[rstest]
+#[tokio::test]
+async fn test_default_only_wallet_reconciles_unchanged() {
+    let state = TestServerState::default();
+    *state.user_fills_response.lock().await = Some(json!([user_fill("BTC", 1001, 11)]));
+    *state.frontend_open_orders_response.lock().await =
+        Some(json!([open_order("BTC", 1001, "95000.0", "0.10000")]));
+    *state.clearinghouse_response.lock().await =
+        Some(clearinghouse_position("BTC", "0.10000", "95000.0"));
+    *state.historical_orders_response.lock().await = Some(json!([historical_order("BTC", 1001)]));
+    let addr = start_mock_server(state).await;
+
+    for client in [create_domain_client(&addr), create_multi_pool_client(&addr)] {
+        cache_btc_instrument(&client);
+
+        let fills = client.request_fill_reports("0xuser", None).await.unwrap();
+        assert_eq!(
+            report_instrument_ids(&fills, |r| r.instrument_id),
+            ["BTC-USD-PERP.HYPERLIQUID"],
+        );
+
+        let orders = client
+            .request_order_status_reports("0xuser", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            report_instrument_ids(&orders, |r| r.instrument_id),
+            ["BTC-USD-PERP.HYPERLIQUID"],
+        );
+
+        let historical = client
+            .request_historical_order_status_reports("0xuser", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            report_instrument_ids(&historical, |r| r.instrument_id),
+            ["BTC-USD-PERP.HYPERLIQUID"],
+        );
+
+        let positions = client
+            .request_position_status_reports("0xuser", Some("BTC-USD-PERP.HYPERLIQUID".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            report_instrument_ids(&positions, |r| r.instrument_id),
+            ["BTC-USD-PERP.HYPERLIQUID"],
+        );
+    }
+}
+
 #[rstest]
 #[tokio::test]
 async fn test_request_order_status_reports_aggregates_all_cached_dexs() {
@@ -1657,7 +2321,7 @@ async fn test_request_order_status_reports_aggregates_all_cached_dexs() {
     configure_open_order_responses(&state).await;
     let addr = start_mock_server(state.clone()).await;
 
-    let client = create_domain_client(&addr);
+    let client = create_multi_pool_client(&addr);
     cache_reconciliation_perps(&client);
 
     let reports = client
@@ -1694,7 +2358,7 @@ async fn test_request_order_status_reports_routes_builder_dex_filter(
     configure_open_order_responses(&state).await;
     let addr = start_mock_server(state.clone()).await;
 
-    let client = create_domain_client(&addr);
+    let client = create_multi_pool_client(&addr);
     cache_reconciliation_perps(&client);
 
     let reports = client
@@ -1754,7 +2418,7 @@ async fn test_request_order_status_reports_fails_when_later_dex_fetch_fails() {
     configure_open_order_responses(&state).await;
     let addr = start_mock_server(state).await;
 
-    let client = create_domain_client(&addr);
+    let client = create_multi_pool_client(&addr);
     cache_reconciliation_perps(&client);
 
     let result = client.request_order_status_reports("0xuser", None).await;
@@ -1769,7 +2433,7 @@ async fn test_request_position_status_reports_aggregates_all_cached_dexs() {
     configure_position_responses(&state).await;
     let addr = start_mock_server(state.clone()).await;
 
-    let client = create_domain_client(&addr);
+    let client = create_multi_pool_client(&addr);
     cache_reconciliation_perps(&client);
 
     let reports = client
@@ -1829,7 +2493,7 @@ async fn test_request_position_status_reports_routes_builder_dex_filter(
     configure_position_responses(&state).await;
     let addr = start_mock_server(state.clone()).await;
 
-    let client = create_domain_client(&addr);
+    let client = create_multi_pool_client(&addr);
     cache_reconciliation_perps(&client);
 
     let reports = client
@@ -1861,7 +2525,7 @@ async fn test_request_position_status_reports_fails_when_later_dex_fetch_fails()
     configure_position_responses(&state).await;
     let addr = start_mock_server(state).await;
 
-    let client = create_domain_client(&addr);
+    let client = create_multi_pool_client(&addr);
     cache_reconciliation_perps(&client);
 
     let result = client.request_position_status_reports("0xuser", None).await;

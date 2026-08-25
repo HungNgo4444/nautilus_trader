@@ -57,7 +57,7 @@ use crate::{
         consts::{HTTP_TIMEOUT, ws_url},
         enums::{HyperliquidBarInterval, HyperliquidEnvironment},
         parse::{
-            bar_type_to_interval, clamp_price_to_precision, derive_limit_from_trigger,
+            DexScope, bar_type_to_interval, clamp_price_to_precision, derive_limit_from_trigger,
             determine_order_list_grouping, extract_error_message, extract_inner_error,
             extract_inner_errors, normalize_price,
             order_to_hyperliquid_request_with_asset_and_cloid, round_to_sig_figs,
@@ -144,6 +144,7 @@ pub struct HyperliquidWebSocketClient {
     post_timeout: Duration,
     task_handle: Option<tokio::task::JoinHandle<()>>,
     account_id: Option<AccountId>,
+    dex_scope: DexScope,
     transport_backend: TransportBackend,
     proxy_url: Option<String>,
     socket_sink: Option<SocketStateSink>,
@@ -176,6 +177,7 @@ impl Clone for HyperliquidWebSocketClient {
             post_timeout: self.post_timeout,
             task_handle: None,
             account_id: self.account_id,
+            dex_scope: self.dex_scope.clone(),
             transport_backend: self.transport_backend,
             proxy_url: self.proxy_url.clone(),
             socket_sink: self.socket_sink.clone(),
@@ -231,12 +233,28 @@ impl HyperliquidWebSocketClient {
             out_rx: None,
             task_handle: None,
             account_id,
+            dex_scope: DexScope::default(),
             transport_backend,
             proxy_url,
             socket_sink: None,
             socket_control: None,
             socket_registration: None,
         }
+    }
+
+    /// Returns the collateral pools execution updates are narrowed to.
+    #[must_use]
+    pub fn dex_scope(&self) -> &DexScope {
+        &self.dex_scope
+    }
+
+    /// Narrows execution updates to the collateral pools `scope` owns.
+    ///
+    /// The user streams cover the whole wallet, so this is what keeps a builder
+    /// (HIP-3) session and a default session on one wallet from reading each
+    /// other's orders and fills.
+    pub fn set_dex_scope(&mut self, scope: DexScope) {
+        self.dex_scope = scope;
     }
 
     /// Configures socket state reporting for the underlying transport.
@@ -345,6 +363,7 @@ impl HyperliquidWebSocketClient {
         // Spawn handler task
         let signal = Arc::clone(&self.signal);
         let account_id = self.account_id;
+        let dex_scope = self.dex_scope.clone();
         let subscriptions = self.subscriptions.clone();
         let book_streams = self.book_streams.clone();
         let cmd_tx_for_reconnect = cmd_tx.clone();
@@ -358,6 +377,7 @@ impl HyperliquidWebSocketClient {
                 raw_rx,
                 out_tx,
                 account_id,
+                dex_scope,
                 subscriptions.clone(),
                 cloid_cache,
                 post_router,

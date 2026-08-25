@@ -120,6 +120,9 @@ struct TestServerState {
     frontend_open_orders_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     /// Optional override for `orderStatus` info responses.
     order_status_response: Arc<tokio::sync::Mutex<Option<Value>>>,
+    /// Optional override for `allPerpMetas` info responses; defaults to the
+    /// default perp dex alone. Set it to publish builder (HIP-3) dex universes.
+    all_perp_metas_response: Arc<tokio::sync::Mutex<Option<Value>>>,
     /// Optional override for `spotClearinghouseState` info responses;
     /// defaults to `{"balances": []}` when unset.
     spot_clearinghouse_response: Arc<tokio::sync::Mutex<Option<Value>>>,
@@ -154,6 +157,7 @@ impl Default for TestServerState {
             fail_frontend_open_orders_count: Arc::new(AtomicUsize::new(0)),
             frontend_open_orders_response: Arc::new(tokio::sync::Mutex::new(None)),
             order_status_response: Arc::new(tokio::sync::Mutex::new(None)),
+            all_perp_metas_response: Arc::new(tokio::sync::Mutex::new(None)),
             spot_clearinghouse_response: Arc::new(tokio::sync::Mutex::new(None)),
             perp_clearinghouse_response: Arc::new(tokio::sync::Mutex::new(None)),
             last_clearinghouse_user: Arc::new(tokio::sync::Mutex::new(None)),
@@ -211,6 +215,9 @@ async fn handle_info(State(state): State<TestServerState>, body: axum::body::Byt
             Json(meta).into_response()
         }
         "allPerpMetas" => {
+            if let Some(body) = state.all_perp_metas_response.lock().await.clone() {
+                return Json(body).into_response();
+            }
             let meta = load_json("http_meta_perp_sample.json");
             Json(json!([meta])).into_response()
         }
@@ -2036,6 +2043,39 @@ async fn test_exec_client_creation() {
             .get(ustr::Ustr::from("hyperliquid-user-streams"))
             .is_none()
     );
+}
+
+// The user streams cover the whole wallet, so the session's collateral scope
+// has to reach the WebSocket client, not the HTTP client alone.
+#[rstest]
+#[case(None, None, "BTC", true)]
+#[case(None, None, "xyz:XYZ100", false)]
+#[case(None, Some(&["xyz"][..]), "xyz:XYZ100", true)]
+#[case(Some("xyz"), None, "BTC", false)]
+#[case(Some("xyz"), None, "xyz:XYZ100", true)]
+#[case(Some("xyz"), Some(&["abc"][..]), "abc:GOLD", false)]
+#[case(Some("abc"), None, "abc:GOLD", true)]
+#[tokio::test]
+async fn test_exec_client_narrows_user_streams_to_the_session_pool(
+    #[case] account_dex: Option<&str>,
+    #[case] reconciliation_dexs: Option<&[&str]>,
+    #[case] coin: &str,
+    #[case] owned: bool,
+) {
+    let state = TestServerState::default();
+    let addr = start_mock_server(state).await;
+
+    let config = HyperliquidExecClientConfig {
+        account_dex: account_dex.map(str::to_string),
+        reconciliation_dexs: reconciliation_dexs
+            .map(|dexs| dexs.iter().map(|dex| (*dex).to_string()).collect()),
+        ..create_test_exec_config(addr)
+    };
+    let expected = config.dex_scope();
+    let (client, _rx, _cache) = create_test_execution_client_from_config(config);
+
+    assert_eq!(client.ws_dex_scope(), &expected);
+    assert_eq!(client.ws_dex_scope().owns_coin(coin), owned);
 }
 
 #[rstest]
@@ -6242,4 +6282,361 @@ async fn test_connect_times_out_when_account_never_registers() {
 
     assert!(!client.is_connected());
     assert!(client.pending_tasks_all_finished());
+}
+
+const DEFAULT_POOL_INSTRUMENT: &str = "BTC-USD-PERP.HYPERLIQUID";
+const XYZ_POOL_INSTRUMENT: &str = "xyz:XYZ100-USD-PERP.HYPERLIQUID";
+const ABC_POOL_INSTRUMENT: &str = "abc:GOLD-USD-PERP.HYPERLIQUID";
+
+/// Publishes the default perp dex plus the `xyz` and `abc` builder (HIP-3)
+/// dexes, so every pool in the scope matrix resolves a real asset index and an
+/// in-pool order can reach the venue instead of stalling on a missing index.
+fn all_perp_metas_with_builder_dexes() -> Value {
+    json!([
+        load_json("http_meta_perp_sample.json"),
+        {"universe": [{"name": "xyz:XYZ100", "szDecimals": 5, "maxLeverage": 20}]},
+        {"universe": [{"name": "abc:GOLD", "szDecimals": 5, "maxLeverage": 20}]},
+    ])
+}
+
+async fn start_multi_dex_mock_server(state: &TestServerState) -> SocketAddr {
+    *state.all_perp_metas_response.lock().await = Some(all_perp_metas_with_builder_dexes());
+    start_mock_server(state.clone()).await
+}
+
+fn exec_config_for_pool(
+    addr: SocketAddr,
+    account_dex: Option<&str>,
+    reconciliation_dexs: Option<&[&str]>,
+) -> HyperliquidExecClientConfig {
+    HyperliquidExecClientConfig {
+        account_dex: account_dex.map(str::to_string),
+        reconciliation_dexs: reconciliation_dexs
+            .map(|dexs| dexs.iter().map(|dex| (*dex).to_string()).collect()),
+        ..create_test_exec_config(addr)
+    }
+}
+
+fn assert_pool_denial_reason(reason: &str, instrument_str: &str, denial: (&str, &str)) {
+    let (settles_in, session_trades) = denial;
+    assert!(reason.contains(instrument_str), "reason: {reason}");
+    assert!(
+        reason.contains(&format!("settles in {settles_in}")),
+        "reason: {reason}",
+    );
+    assert!(
+        reason.contains(&format!("but this session trades {session_trades}")),
+        "reason: {reason}",
+    );
+}
+
+async fn wait_for_exchange_request(exchange_count: &Arc<tokio::sync::Mutex<usize>>) {
+    let counter = exchange_count.clone();
+    wait_until_async(
+        move || {
+            let counter = counter.clone();
+            async move { *counter.lock().await >= 1 }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+/// Builds an order list whose legs sit on `instrument_strs`, registering every
+/// leg in `cache` so `get_orders_for_list` resolves them.
+fn make_order_list_cmd(
+    cache: &Rc<RefCell<Cache>>,
+    list_id: &str,
+    instrument_strs: &[&str],
+) -> (Vec<OrderAny>, SubmitOrderList) {
+    let trader_id = TraderId::from("TESTER-001");
+    let strategy_id = StrategyId::from("S-001");
+    let mut orders = Vec::new();
+    let mut init_events = Vec::new();
+    let mut client_order_ids = Vec::new();
+
+    for (index, instrument_str) in instrument_strs.iter().enumerate() {
+        let order = make_limit_order_on_instrument(
+            &format!("{list_id}-{index}"),
+            InstrumentId::from(*instrument_str),
+        );
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+        init_events.push(order.init_event().clone());
+        client_order_ids.push(order.client_order_id());
+        orders.push(order);
+    }
+
+    let order_list = OrderList::new(
+        OrderListId::from(list_id),
+        InstrumentId::from(instrument_strs[0]),
+        strategy_id,
+        client_order_ids,
+        UnixNanos::default(),
+    );
+
+    let cmd = SubmitOrderList::new(
+        trader_id,
+        Some(*HYPERLIQUID_CLIENT_ID),
+        strategy_id,
+        order_list,
+        init_events,
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::default(),
+        None, // correlation_id
+    );
+
+    (orders, cmd)
+}
+
+// The submit gate is the second line of defence behind reconciliation
+// filtering: an order for another collateral pool draws margin this session
+// neither funds nor reconciles, and reconciliation then hides the resulting
+// order from the node that sent it. The matrix walks every {account_dex} x
+// {instrument pool} x {reconciliation_dexs} combination, and the guard is
+// symmetric: a pinned session refuses default-pool instruments just as a
+// default session refuses builder coins it never opted into.
+#[rstest]
+#[case(None, None, DEFAULT_POOL_INSTRUMENT, None)]
+#[case(None, None, XYZ_POOL_INSTRUMENT, Some(("builder dex 'xyz'", "the default pool")))]
+#[case(None, None, ABC_POOL_INSTRUMENT, Some(("builder dex 'abc'", "the default pool")))]
+#[case(None, Some(&["xyz"][..]), DEFAULT_POOL_INSTRUMENT, None)]
+#[case(None, Some(&["xyz"][..]), XYZ_POOL_INSTRUMENT, None)]
+#[case(
+    None,
+    Some(&["xyz"][..]),
+    ABC_POOL_INSTRUMENT,
+    Some(("builder dex 'abc'", "the default pool and builder dexes 'xyz'"))
+)]
+#[case(Some("xyz"), None, DEFAULT_POOL_INSTRUMENT, Some(("the default pool", "builder dex 'xyz'")))]
+#[case(Some("xyz"), None, XYZ_POOL_INSTRUMENT, None)]
+#[case(Some("xyz"), None, ABC_POOL_INSTRUMENT, Some(("builder dex 'abc'", "builder dex 'xyz'")))]
+#[case(
+    Some("xyz"),
+    Some(&["xyz"][..]),
+    DEFAULT_POOL_INSTRUMENT,
+    Some(("the default pool", "builder dex 'xyz'"))
+)]
+#[case(Some("xyz"), Some(&["xyz"][..]), XYZ_POOL_INSTRUMENT, None)]
+#[case(
+    Some("xyz"),
+    Some(&["xyz"][..]),
+    ABC_POOL_INSTRUMENT,
+    Some(("builder dex 'abc'", "builder dex 'xyz'"))
+)]
+#[case(Some("abc"), None, DEFAULT_POOL_INSTRUMENT, Some(("the default pool", "builder dex 'abc'")))]
+#[case(Some("abc"), None, XYZ_POOL_INSTRUMENT, Some(("builder dex 'xyz'", "builder dex 'abc'")))]
+#[case(Some("abc"), None, ABC_POOL_INSTRUMENT, None)]
+#[case(
+    Some("abc"),
+    Some(&["xyz"][..]),
+    DEFAULT_POOL_INSTRUMENT,
+    Some(("the default pool", "builder dex 'abc'"))
+)]
+#[case(
+    Some("abc"),
+    Some(&["xyz"][..]),
+    XYZ_POOL_INSTRUMENT,
+    Some(("builder dex 'xyz'", "builder dex 'abc'"))
+)]
+#[case(Some("abc"), Some(&["xyz"][..]), ABC_POOL_INSTRUMENT, None)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_submit_order_denies_instrument_outside_the_session_pool(
+    #[case] account_dex: Option<&str>,
+    #[case] reconciliation_dexs: Option<&[&str]>,
+    #[case] instrument_str: &str,
+    #[case] denial: Option<(&str, &str)>,
+) {
+    let state = TestServerState::default();
+    let exchange_count = state.exchange_request_count.clone();
+    let last_action = state.last_exchange_action.clone();
+    let addr = start_multi_dex_mock_server(&state).await;
+
+    let config = exec_config_for_pool(addr, account_dex, reconciliation_dexs);
+    let (mut client, mut rx, cache) = create_test_execution_client_from_config(config);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let order = make_limit_order_on_instrument("O-POOL-GUARD", InstrumentId::from(instrument_str));
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+
+    client.submit_order(make_submit_cmd(&order)).unwrap();
+
+    if let Some(denial) = denial {
+        let denied = drain_denied_events(&mut rx, Duration::from_millis(250)).await;
+        assert_eq!(denied.len(), 1, "an out-of-pool order is denied once");
+        assert_eq!(denied[0].0, order.client_order_id());
+        assert_pool_denial_reason(&denied[0].1, instrument_str, denial);
+        assert_eq!(
+            *exchange_count.lock().await,
+            0,
+            "a denied order must not reach the venue",
+        );
+    } else {
+        wait_for_exchange_request(&exchange_count).await;
+        let action = last_action.lock().await.clone().expect("missing action");
+        assert_eq!(action.get("type").and_then(|v| v.as_str()), Some("order"));
+
+        let denied = drain_denied_events(&mut rx, Duration::from_millis(250)).await;
+        assert!(
+            denied.is_empty(),
+            "an in-pool order is not denied: {denied:?}"
+        );
+    }
+
+    client.disconnect().await.unwrap();
+}
+
+// An order list submits whole or not at all: brackets and OCO legs only make
+// sense together, so one leg outside the session pool denies every leg rather
+// than leaving a half-armed list working on the venue.
+#[rstest]
+#[case(None, None, DEFAULT_POOL_INSTRUMENT, None)]
+#[case(None, None, XYZ_POOL_INSTRUMENT, Some(("builder dex 'xyz'", "the default pool")))]
+#[case(None, None, ABC_POOL_INSTRUMENT, Some(("builder dex 'abc'", "the default pool")))]
+#[case(None, Some(&["xyz"][..]), DEFAULT_POOL_INSTRUMENT, None)]
+#[case(None, Some(&["xyz"][..]), XYZ_POOL_INSTRUMENT, None)]
+#[case(
+    None,
+    Some(&["xyz"][..]),
+    ABC_POOL_INSTRUMENT,
+    Some(("builder dex 'abc'", "the default pool and builder dexes 'xyz'"))
+)]
+#[case(Some("xyz"), None, DEFAULT_POOL_INSTRUMENT, Some(("the default pool", "builder dex 'xyz'")))]
+#[case(Some("xyz"), None, XYZ_POOL_INSTRUMENT, None)]
+#[case(Some("xyz"), None, ABC_POOL_INSTRUMENT, Some(("builder dex 'abc'", "builder dex 'xyz'")))]
+#[case(
+    Some("xyz"),
+    Some(&["xyz"][..]),
+    DEFAULT_POOL_INSTRUMENT,
+    Some(("the default pool", "builder dex 'xyz'"))
+)]
+#[case(Some("xyz"), Some(&["xyz"][..]), XYZ_POOL_INSTRUMENT, None)]
+#[case(
+    Some("xyz"),
+    Some(&["xyz"][..]),
+    ABC_POOL_INSTRUMENT,
+    Some(("builder dex 'abc'", "builder dex 'xyz'"))
+)]
+#[case(Some("abc"), None, DEFAULT_POOL_INSTRUMENT, Some(("the default pool", "builder dex 'abc'")))]
+#[case(Some("abc"), None, XYZ_POOL_INSTRUMENT, Some(("builder dex 'xyz'", "builder dex 'abc'")))]
+#[case(Some("abc"), None, ABC_POOL_INSTRUMENT, None)]
+#[case(
+    Some("abc"),
+    Some(&["xyz"][..]),
+    DEFAULT_POOL_INSTRUMENT,
+    Some(("the default pool", "builder dex 'abc'"))
+)]
+#[case(
+    Some("abc"),
+    Some(&["xyz"][..]),
+    XYZ_POOL_INSTRUMENT,
+    Some(("builder dex 'xyz'", "builder dex 'abc'"))
+)]
+#[case(Some("abc"), Some(&["xyz"][..]), ABC_POOL_INSTRUMENT, None)]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_submit_order_list_denies_instrument_outside_the_session_pool(
+    #[case] account_dex: Option<&str>,
+    #[case] reconciliation_dexs: Option<&[&str]>,
+    #[case] instrument_str: &str,
+    #[case] denial: Option<(&str, &str)>,
+) {
+    let state = TestServerState::default();
+    let exchange_count = state.exchange_request_count.clone();
+    let last_action = state.last_exchange_action.clone();
+    let addr = start_multi_dex_mock_server(&state).await;
+
+    let config = exec_config_for_pool(addr, account_dex, reconciliation_dexs);
+    let (mut client, mut rx, cache) = create_test_execution_client_from_config(config);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let (orders, cmd) =
+        make_order_list_cmd(&cache, "L-POOL-GUARD", &[instrument_str, instrument_str]);
+
+    client.submit_order_list(cmd).unwrap();
+
+    if let Some(denial) = denial {
+        let denied = drain_denied_events(&mut rx, Duration::from_millis(250)).await;
+        assert_eq!(denied.len(), orders.len(), "every leg is denied");
+        for (index, order) in orders.iter().enumerate() {
+            assert_eq!(denied[index].0, order.client_order_id());
+            assert!(
+                denied[index].1.starts_with("Order list denied: "),
+                "reason: {}",
+                denied[index].1,
+            );
+            assert_pool_denial_reason(&denied[index].1, instrument_str, denial);
+        }
+        assert_eq!(
+            *exchange_count.lock().await,
+            0,
+            "a denied order list must not reach the venue",
+        );
+    } else {
+        wait_for_exchange_request(&exchange_count).await;
+        let action = last_action.lock().await.clone().expect("missing action");
+        assert_eq!(action.get("type").and_then(|v| v.as_str()), Some("order"));
+
+        let denied = drain_denied_events(&mut rx, Duration::from_millis(250)).await;
+        assert!(
+            denied.is_empty(),
+            "an in-pool list is not denied: {denied:?}"
+        );
+    }
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test(flavor = "multi_thread")]
+async fn test_submit_order_list_denies_every_leg_when_one_leg_is_outside_the_pool() {
+    // A mixed list names the offending leg in the reason and denies the in-pool
+    // leg too: submitting only the legs that pass would leave a partial bracket
+    // working on the venue with no counterpart to close it.
+    let state = TestServerState::default();
+    let exchange_count = state.exchange_request_count.clone();
+    let addr = start_multi_dex_mock_server(&state).await;
+
+    let config = exec_config_for_pool(addr, None, None);
+    let (mut client, mut rx, cache) = create_test_execution_client_from_config(config);
+    add_test_account_to_cache(&cache, AccountId::from("HYPERLIQUID-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let (orders, cmd) = make_order_list_cmd(
+        &cache,
+        "L-POOL-MIXED",
+        &[DEFAULT_POOL_INSTRUMENT, XYZ_POOL_INSTRUMENT],
+    );
+
+    client.submit_order_list(cmd).unwrap();
+
+    let denied = drain_denied_events(&mut rx, Duration::from_millis(250)).await;
+    assert_eq!(denied.len(), 2, "both legs are denied");
+    for (index, order) in orders.iter().enumerate() {
+        assert_eq!(denied[index].0, order.client_order_id());
+        assert_pool_denial_reason(
+            &denied[index].1,
+            XYZ_POOL_INSTRUMENT,
+            ("builder dex 'xyz'", "the default pool"),
+        );
+    }
+    assert_eq!(
+        *exchange_count.lock().await,
+        0,
+        "a denied order list must not reach the venue",
+    );
+
+    client.disconnect().await.unwrap();
 }

@@ -61,9 +61,12 @@ use super::{
     post::PostRouter,
     trades::TradeStreamUses,
 };
-use crate::data_types::{
-    HyperliquidAllDexsAssetCtxs, HyperliquidAllMids, HyperliquidDexAssetCtx,
-    HyperliquidImpactPrices,
+use crate::{
+    common::parse::DexScope,
+    data_types::{
+        HyperliquidAllDexsAssetCtxs, HyperliquidAllMids, HyperliquidDexAssetCtx,
+        HyperliquidImpactPrices,
+    },
 };
 
 /// Commands sent from the outer client to the inner message handler.
@@ -220,6 +223,7 @@ pub(super) struct FeedHandler {
     raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
     out_tx: tokio::sync::mpsc::UnboundedSender<NautilusWsMessage>,
     account_id: Option<AccountId>,
+    dex_scope: DexScope,
     subscriptions: SubscriptionState,
     all_mids_data_types: AllMidsDataTypeCache,
     post_router: Arc<PostRouter>,
@@ -250,6 +254,7 @@ impl FeedHandler {
         raw_rx: tokio::sync::mpsc::UnboundedReceiver<Message>,
         out_tx: tokio::sync::mpsc::UnboundedSender<NautilusWsMessage>,
         account_id: Option<AccountId>,
+        dex_scope: DexScope,
         subscriptions: SubscriptionState,
         cloid_cache: CloidCache,
         post_router: Arc<PostRouter>,
@@ -262,6 +267,7 @@ impl FeedHandler {
             raw_rx,
             out_tx,
             account_id,
+            dex_scope,
             subscriptions,
             all_mids_data_types: AllMidsDataTypeCache::default(),
             post_router,
@@ -473,6 +479,7 @@ impl FeedHandler {
                                         &self.cloid_cache,
                                         &self.bar_types_cache,
                                         self.account_id,
+                                        &self.dex_scope,
                                         ts_init,
                                         &self.asset_context_subs,
                                         &self.trade_subs,
@@ -526,6 +533,7 @@ impl FeedHandler {
         cloid_cache: &CloidCache,
         bar_types: &AHashMap<String, BarType>,
         account_id: Option<AccountId>,
+        dex_scope: &DexScope,
         ts_init: UnixNanos,
         asset_context_subs: &AHashMap<Ustr, AHashSet<AssetContextDataType>>,
         trade_subs: &AHashMap<Ustr, TradeStreamUses>,
@@ -547,6 +555,7 @@ impl FeedHandler {
                         instruments,
                         cloid_cache,
                         account_id,
+                        dex_scope,
                         ts_init,
                     )
                 {
@@ -577,6 +586,7 @@ impl FeedHandler {
                                 instruments,
                                 cloid_cache,
                                 account_id,
+                                dex_scope,
                                 ts_init,
                                 processed_trade_ids,
                             ) {
@@ -613,6 +623,7 @@ impl FeedHandler {
                         instruments,
                         cloid_cache,
                         account_id,
+                        dex_scope,
                         ts_init,
                         processed_trade_ids,
                     )
@@ -729,11 +740,16 @@ impl FeedHandler {
         instruments: &AHashMap<Ustr, InstrumentAny>,
         cloid_cache: &CloidCache,
         account_id: AccountId,
+        dex_scope: &DexScope,
         ts_init: UnixNanos,
     ) -> Option<NautilusWsMessage> {
         let mut exec_reports = Vec::new();
 
         for order_update in data {
+            if !dex_scope.owns_coin(order_update.order.coin.as_str()) {
+                continue;
+            }
+
             let instrument = instruments.get(&order_update.order.coin);
 
             if let Some(instrument) = instrument {
@@ -776,12 +792,17 @@ impl FeedHandler {
         instruments: &AHashMap<Ustr, InstrumentAny>,
         cloid_cache: &CloidCache,
         account_id: AccountId,
+        dex_scope: &DexScope,
         ts_init: UnixNanos,
         processed_trade_ids: &mut FifoCache<u64, 10_000>,
     ) -> Option<NautilusWsMessage> {
         let mut exec_reports = Vec::new();
 
         for fill in fills {
+            if !dex_scope.owns_coin(fill.coin.as_str()) {
+                continue;
+            }
+
             if processed_trade_ids.contains(&fill.tid) {
                 log::debug!("Skipping duplicate fill: tid={}", fill.tid);
                 continue;
@@ -1413,11 +1434,12 @@ mod tests {
 
     use ahash::{AHashMap, AHashSet};
     use log::{Level, LevelFilter, Log, Metadata, Record};
-    use nautilus_common::cache::fifo::FifoCacheMap;
+    use nautilus_common::cache::fifo::{FifoCache, FifoCacheMap};
     use nautilus_core::nanos::UnixNanos;
     use nautilus_model::{
         data::Data,
-        identifiers::{ClientOrderId, InstrumentId, Symbol},
+        enums::CurrencyType,
+        identifiers::{AccountId, ClientOrderId, InstrumentId, Symbol},
         instruments::{CryptoPerpetual, Instrument, InstrumentAny},
         types::{Currency, Price, Quantity},
     };
@@ -1432,16 +1454,17 @@ mod tests {
         super::{
             client::{AssetContextDataType, CLOID_CACHE_CAPACITY, CloidCache},
             messages::{
-                HyperliquidWsRequest, NautilusWsMessage, PerpsAssetCtx, PostRequest,
-                SharedAssetCtx, SpotAssetCtx, SubscriptionRequest, WsActiveAssetCtxData,
-                WsAllDexsAssetCtxsData, WsBookData, WsLevelData,
+                ExecutionReport, HyperliquidWsMessage, HyperliquidWsRequest, NautilusWsMessage,
+                PerpsAssetCtx, PostRequest, SharedAssetCtx, SpotAssetCtx, SubscriptionRequest,
+                WsActiveAssetCtxData, WsAllDexsAssetCtxsData, WsBookData, WsFillData, WsLevelData,
+                WsOrderData, WsUserEventData, WsUserFillsData,
             },
             post::PostRouter,
         },
         AllMidsDataTypeCache, AssetContextCaches, FeedHandler, HandlerCommand,
     };
     use crate::{
-        common::consts::HYPERLIQUID_VENUE,
+        common::{consts::HYPERLIQUID_VENUE, parse::DexScope},
         data_types::{HyperliquidAllDexsAssetCtxs, HyperliquidOpenInterest},
     };
 
@@ -1655,6 +1678,7 @@ mod tests {
             raw_rx,
             out_tx,
             None,
+            DexScope::default(),
             SubscriptionState::new(':'),
             cloid_cache,
             Arc::clone(&post_router),
@@ -1709,6 +1733,7 @@ mod tests {
             raw_rx,
             out_tx,
             None,
+            DexScope::default(),
             SubscriptionState::new(':'),
             cloid_cache,
             post_router,
@@ -2057,5 +2082,343 @@ mod tests {
         assert!(caches.index_price.get(&coin).is_none());
         assert_eq!(caches.funding_rate.get(&coin).copied(), Some(dec!(0.0001)));
         assert!(caches.open_interest.get(&coin).is_none());
+    }
+
+    fn builder_perp(coin: &str) -> InstrumentAny {
+        let symbol = format!("{coin}-PERP");
+        let base = coin.split_once(':').map_or(coin, |(_, base)| base);
+
+        InstrumentAny::CryptoPerpetual(CryptoPerpetual::new(
+            InstrumentId::new(Symbol::new(&symbol), *HYPERLIQUID_VENUE),
+            Symbol::new(&symbol),
+            Currency::new(base, 8, 0, base, CurrencyType::Crypto),
+            Currency::from("USDC"),
+            Currency::from("USDC"),
+            false,
+            2,
+            3,
+            Price::from("0.01"),
+            Quantity::from("0.001"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            UnixNanos::default(),
+            UnixNanos::default(),
+        ))
+    }
+
+    /// One wallet holding the default pool and two builder (HIP-3) pools.
+    fn dex_instruments() -> AHashMap<Ustr, InstrumentAny> {
+        AHashMap::from_iter([
+            (Ustr::from("BTC"), btc_perp()),
+            (Ustr::from("xyz:XYZ100"), builder_perp("xyz:XYZ100")),
+            (Ustr::from("abc:GOLD"), builder_perp("abc:GOLD")),
+        ])
+    }
+
+    /// The default pool alone, as a wallet that never touched a builder dex.
+    fn default_pool_instruments() -> AHashMap<Ustr, InstrumentAny> {
+        AHashMap::from_iter([(Ustr::from("BTC"), btc_perp())])
+    }
+
+    fn scope(account_dex: Option<&str>) -> DexScope {
+        DexScope::new(account_dex.map(Ustr::from), Vec::new())
+    }
+
+    fn empty_cloid_cache() -> CloidCache {
+        Arc::new(Mutex::new(FifoCacheMap::<
+            Ustr,
+            ClientOrderId,
+            CLOID_CACHE_CAPACITY,
+        >::new()))
+    }
+
+    fn ws_fill(coin: &str, oid: u64, tid: u64) -> WsFillData {
+        serde_json::from_value(json!({
+            "coin": coin,
+            "px": "100.00",
+            "sz": "1.000",
+            "side": "B",
+            "time": 1_700_000_000_000u64,
+            "startPosition": "0.0",
+            "dir": "Open Long",
+            "closedPnl": "0.0",
+            "hash": "0xfeed",
+            "oid": oid,
+            "crossed": true,
+            "fee": "0.1",
+            "tid": tid,
+            "feeToken": "USDC",
+            "cloid": null,
+            "twapId": null
+        }))
+        .unwrap()
+    }
+
+    fn ws_order(coin: &str, oid: u64) -> WsOrderData {
+        serde_json::from_value(json!({
+            "order": {
+                "coin": coin,
+                "side": "B",
+                "limitPx": "100.00",
+                "sz": "1.000",
+                "oid": oid,
+                "timestamp": 1_700_000_000_000u64,
+                "origSz": "1.000",
+                "cloid": null,
+                "tif": "Gtc",
+                "reduceOnly": false
+            },
+            "status": "open",
+            "statusTimestamp": 1_700_000_000_000u64
+        }))
+        .unwrap()
+    }
+
+    fn fill_instrument_ids(msg: Option<NautilusWsMessage>) -> Vec<InstrumentId> {
+        let Some(NautilusWsMessage::ExecutionReports(reports)) = msg else {
+            return Vec::new();
+        };
+
+        reports
+            .iter()
+            .map(|report| match report {
+                ExecutionReport::Fill(report) => report.instrument_id,
+                ExecutionReport::Order(report) => report.instrument_id,
+            })
+            .collect()
+    }
+
+    fn all_pool_fills() -> [WsFillData; 3] {
+        [
+            ws_fill("BTC", 1001, 11),
+            ws_fill("xyz:XYZ100", 3003, 33),
+            ws_fill("abc:GOLD", 4004, 44),
+        ]
+    }
+
+    fn all_pool_orders() -> [WsOrderData; 3] {
+        [
+            ws_order("BTC", 1001),
+            ws_order("xyz:XYZ100", 3003),
+            ws_order("abc:GOLD", 4004),
+        ]
+    }
+
+    fn expected_ids(expected: &[&str]) -> Vec<InstrumentId> {
+        expected.iter().copied().map(InstrumentId::from).collect()
+    }
+
+    fn dispatch(
+        msg: HyperliquidWsMessage,
+        instruments: &AHashMap<Ustr, InstrumentAny>,
+        dex_scope: &DexScope,
+    ) -> Vec<InstrumentId> {
+        let mut processed_trade_ids = FifoCache::<u64, 10_000>::new();
+        let mut processed_public_trade_ids = FifoCache::<(Ustr, u64), 10_000>::new();
+        let mut asset_context_caches = AssetContextCaches::default();
+        let mut bar_cache = AHashMap::new();
+
+        let messages = FeedHandler::parse_to_nautilus_messages(
+            msg,
+            instruments,
+            &empty_cloid_cache(),
+            &AHashMap::new(),
+            Some(AccountId::new("HYPERLIQUID-master")),
+            dex_scope,
+            UnixNanos::default(),
+            &AHashMap::new(),
+            &AHashMap::new(),
+            &AHashSet::new(),
+            &mut processed_trade_ids,
+            &mut processed_public_trade_ids,
+            &mut asset_context_caches,
+            &mut bar_cache,
+            &AHashMap::new(),
+            &[],
+        );
+
+        messages
+            .into_iter()
+            .flat_map(|msg| fill_instrument_ids(Some(msg)))
+            .collect()
+    }
+
+    // The {account_dex} x {event coin pool} matrix: a session reports the pool
+    // it was configured for and drops every other pool's fills.
+    #[rstest]
+    #[case(None, &["BTC-PERP.HYPERLIQUID"])]
+    #[case(Some("xyz"), &["xyz:XYZ100-PERP.HYPERLIQUID"])]
+    #[case(Some("abc"), &["abc:GOLD-PERP.HYPERLIQUID"])]
+    fn handle_user_fills_keeps_only_the_account_dex_pool(
+        #[case] account_dex: Option<&str>,
+        #[case] expected: &[&str],
+    ) {
+        let mut processed_trade_ids = FifoCache::<u64, 10_000>::new();
+
+        let msg = FeedHandler::handle_user_fills(
+            &all_pool_fills(),
+            &dex_instruments(),
+            &empty_cloid_cache(),
+            AccountId::new("HYPERLIQUID-master"),
+            &scope(account_dex),
+            UnixNanos::default(),
+            &mut processed_trade_ids,
+        );
+
+        assert_eq!(fill_instrument_ids(msg), expected_ids(expected));
+    }
+
+    #[rstest]
+    #[case(None, &["BTC-PERP.HYPERLIQUID"])]
+    #[case(Some("xyz"), &["xyz:XYZ100-PERP.HYPERLIQUID"])]
+    #[case(Some("abc"), &["abc:GOLD-PERP.HYPERLIQUID"])]
+    fn handle_order_updates_keeps_only_the_account_dex_pool(
+        #[case] account_dex: Option<&str>,
+        #[case] expected: &[&str],
+    ) {
+        let msg = FeedHandler::handle_order_updates(
+            &all_pool_orders(),
+            &dex_instruments(),
+            &empty_cloid_cache(),
+            AccountId::new("HYPERLIQUID-master"),
+            &scope(account_dex),
+            UnixNanos::default(),
+        );
+
+        assert_eq!(fill_instrument_ids(msg), expected_ids(expected));
+    }
+
+    // The same matrix through the dispatch that the socket feeds, so a scope
+    // that never reaches a handler is caught as well as a missing filter.
+    #[rstest]
+    #[case(None, &["BTC-PERP.HYPERLIQUID"])]
+    #[case(Some("xyz"), &["xyz:XYZ100-PERP.HYPERLIQUID"])]
+    #[case(Some("abc"), &["abc:GOLD-PERP.HYPERLIQUID"])]
+    fn dispatch_user_events_keeps_only_the_account_dex_pool(
+        #[case] account_dex: Option<&str>,
+        #[case] expected: &[&str],
+    ) {
+        let msg = HyperliquidWsMessage::UserEvents {
+            data: WsUserEventData::Fills {
+                fills: all_pool_fills().to_vec(),
+            },
+        };
+
+        assert_eq!(
+            dispatch(msg, &dex_instruments(), &scope(account_dex)),
+            expected_ids(expected),
+        );
+    }
+
+    #[rstest]
+    #[case(None, &["BTC-PERP.HYPERLIQUID"])]
+    #[case(Some("xyz"), &["xyz:XYZ100-PERP.HYPERLIQUID"])]
+    #[case(Some("abc"), &["abc:GOLD-PERP.HYPERLIQUID"])]
+    fn dispatch_user_fills_keeps_only_the_account_dex_pool(
+        #[case] account_dex: Option<&str>,
+        #[case] expected: &[&str],
+    ) {
+        let msg = HyperliquidWsMessage::UserFills {
+            data: WsUserFillsData {
+                user: "0xuser".to_string(),
+                is_snapshot: None,
+                fills: all_pool_fills().to_vec(),
+            },
+        };
+
+        assert_eq!(
+            dispatch(msg, &dex_instruments(), &scope(account_dex)),
+            expected_ids(expected),
+        );
+    }
+
+    #[rstest]
+    #[case(None, &["BTC-PERP.HYPERLIQUID"])]
+    #[case(Some("xyz"), &["xyz:XYZ100-PERP.HYPERLIQUID"])]
+    #[case(Some("abc"), &["abc:GOLD-PERP.HYPERLIQUID"])]
+    fn dispatch_order_updates_keeps_only_the_account_dex_pool(
+        #[case] account_dex: Option<&str>,
+        #[case] expected: &[&str],
+    ) {
+        let msg = HyperliquidWsMessage::OrderUpdates {
+            data: all_pool_orders().to_vec(),
+        };
+
+        assert_eq!(
+            dispatch(msg, &dex_instruments(), &scope(account_dex)),
+            expected_ids(expected),
+        );
+    }
+
+    // A wallet that never touched a builder dex must read exactly as it did
+    // before the pools existed.
+    #[rstest]
+    fn dispatch_on_a_default_only_wallet_is_unchanged() {
+        let instruments = default_pool_instruments();
+        let fills = [ws_fill("BTC", 1001, 11)];
+        let orders = [ws_order("BTC", 1001)];
+
+        let fills_msg = HyperliquidWsMessage::UserEvents {
+            data: WsUserEventData::Fills {
+                fills: fills.to_vec(),
+            },
+        };
+        let orders_msg = HyperliquidWsMessage::OrderUpdates {
+            data: orders.to_vec(),
+        };
+
+        assert_eq!(
+            dispatch(fills_msg, &instruments, &DexScope::default()),
+            expected_ids(&["BTC-PERP.HYPERLIQUID"]),
+        );
+        assert_eq!(
+            dispatch(orders_msg, &instruments, &DexScope::default()),
+            expected_ids(&["BTC-PERP.HYPERLIQUID"]),
+        );
+    }
+
+    // An opted-in default session reads its own pool and the builder dexes it
+    // named, and still nothing else.
+    #[rstest]
+    #[case(&[], &["BTC-PERP.HYPERLIQUID"])]
+    #[case(&["xyz"], &["BTC-PERP.HYPERLIQUID", "xyz:XYZ100-PERP.HYPERLIQUID"])]
+    #[case(
+        &["xyz", "abc"],
+        &[
+            "BTC-PERP.HYPERLIQUID",
+            "xyz:XYZ100-PERP.HYPERLIQUID",
+            "abc:GOLD-PERP.HYPERLIQUID",
+        ],
+    )]
+    fn dispatch_widens_a_default_session_by_extra_dexes(
+        #[case] extra_dexes: &[&str],
+        #[case] expected: &[&str],
+    ) {
+        let scope = DexScope::new(
+            None,
+            extra_dexes.iter().map(|dex| Ustr::from(dex)).collect(),
+        );
+        let msg = HyperliquidWsMessage::UserEvents {
+            data: WsUserEventData::Fills {
+                fills: all_pool_fills().to_vec(),
+            },
+        };
+
+        assert_eq!(
+            dispatch(msg, &dex_instruments(), &scope),
+            expected_ids(expected),
+        );
     }
 }

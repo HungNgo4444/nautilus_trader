@@ -67,11 +67,12 @@ use crate::{
             HyperliquidOrderStatus as HyperliquidOrderStatusEnum, HyperliquidProductType,
         },
         parse::{
-            bar_type_to_interval, cache_alias_for_symbol, clamp_price_to_precision,
-            derive_limit_from_trigger, determine_order_list_grouping, extract_inner_error,
-            normalize_price, order_to_hyperliquid_request_with_asset_and_cloid,
-            parse_account_balances_and_margins, parse_combined_account_balances_and_margins,
-            parse_spot_account_balances, parse_trigger_order_type, round_to_sig_figs,
+            DexScope, VAULT_TOKEN_PREFIX, bar_type_to_interval, cache_alias_for_symbol,
+            clamp_price_to_precision, derive_limit_from_trigger, determine_order_list_grouping,
+            extract_inner_error, normalize_price,
+            order_to_hyperliquid_request_with_asset_and_cloid, parse_account_balances_and_margins,
+            parse_combined_account_balances_and_margins, parse_spot_account_balances,
+            parse_trigger_order_type, perp_dex_from_symbol, round_to_sig_figs,
             time_in_force_to_hyperliquid_tif,
         },
     },
@@ -911,10 +912,9 @@ pub struct HyperliquidHttpClient {
     normalize_prices: bool,
     market_order_slippage_bps: u32,
     include_builder_attribution: bool,
-    /// Builder dexes included in unfiltered reconciliation; `None` includes every cached one.
-    reconciliation_dexs: Option<Vec<Ustr>>,
-    /// The collateral pool the account state reads; `None` = default perp + spot.
-    account_dex: Option<Ustr>,
+    /// The collateral pools this session owns; the default scope owns the
+    /// default perp, spot, outcome and vault coins alone.
+    dex_scope: DexScope,
 }
 
 impl Default for HyperliquidHttpClient {
@@ -968,8 +968,7 @@ impl HyperliquidHttpClient {
             normalize_prices: true,
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
             include_builder_attribution: true,
-            reconciliation_dexs: None,
-            account_dex: None,
+            dex_scope: DexScope::default(),
         }
     }
 
@@ -1088,8 +1087,7 @@ impl HyperliquidHttpClient {
             normalize_prices: true,
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
             include_builder_attribution: true,
-            reconciliation_dexs: None,
-            account_dex: None,
+            dex_scope: DexScope::default(),
         })
     }
 
@@ -1168,8 +1166,7 @@ impl HyperliquidHttpClient {
                     normalize_prices: true,
                     market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
                     include_builder_attribution: true,
-                    reconciliation_dexs: None,
-                    account_dex: None,
+                    dex_scope: DexScope::default(),
                 })
             }
             None => {
@@ -1214,8 +1211,7 @@ impl HyperliquidHttpClient {
             normalize_prices: true,
             market_order_slippage_bps: crate::common::parse::DEFAULT_MARKET_SLIPPAGE_BPS,
             include_builder_attribution: true,
-            reconciliation_dexs: None,
-            account_dex: None,
+            dex_scope: DexScope::default(),
         })
     }
 
@@ -1258,21 +1254,37 @@ impl HyperliquidHttpClient {
         self.include_builder_attribution = value;
     }
 
-    /// Sets the builder dexes included in unfiltered reconciliation.
-    ///
-    /// `None` includes every builder dex represented by the cached perpetual
-    /// instruments; an empty list limits reconciliation to the default perp dex.
-    pub fn set_reconciliation_dexs(&mut self, dexs: Option<Vec<String>>) {
-        self.reconciliation_dexs =
-            dexs.map(|dexs| dexs.iter().map(|dex| Ustr::from(dex)).collect());
+    /// Returns the collateral pools this session owns.
+    #[must_use]
+    pub fn dex_scope(&self) -> &DexScope {
+        &self.dex_scope
     }
 
-    /// Sets the collateral pool the account state reads.
+    /// Sets the collateral pools this session owns.
+    pub fn set_dex_scope(&mut self, scope: DexScope) {
+        self.dex_scope = scope;
+    }
+
+    /// Sets the builder dexes a default session additionally owns.
+    ///
+    /// `None` and an empty list both leave the session on the default pool
+    /// alone; a pinned session (see `set_account_dex`) ignores the list.
+    pub fn set_reconciliation_dexs(&mut self, dexs: Option<Vec<String>>) {
+        self.dex_scope.set_extra_dexes(
+            dexs.unwrap_or_default()
+                .iter()
+                .map(|dex| Ustr::from(dex))
+                .collect(),
+        );
+    }
+
+    /// Pins this session to one collateral pool.
     ///
     /// `None` reads the default perp clearinghouse combined with spot balances;
     /// a builder (HIP-3) dex name reads that dex's clearinghouse alone.
     pub fn set_account_dex(&mut self, dex: Option<String>) {
-        self.account_dex = dex.map(|dex| Ustr::from(&dex));
+        self.dex_scope
+            .set_account_dex(dex.map(|dex| Ustr::from(&dex)));
     }
 
     /// Gets the user address derived from the private key (if client has credentials).
@@ -1424,7 +1436,7 @@ impl HyperliquidHttpClient {
         }
 
         // Vault tokens aren't in standard API, create synthetic instruments
-        if coin.as_str().starts_with("vntls:") {
+        if coin.as_str().starts_with(VAULT_TOKEN_PREFIX) {
             log::debug!("Creating synthetic instrument for vault token: {coin}");
 
             let ts_event = self.clock.get_time_ns();
@@ -1824,6 +1836,16 @@ impl HyperliquidHttpClient {
     /// Get frontend open orders (includes more detail) for a user.
     pub async fn info_frontend_open_orders(&self, user: &str) -> Result<Value> {
         self.inner.info_frontend_open_orders(user).await
+    }
+
+    /// Get frontend open orders from the pool this session is pinned to.
+    ///
+    /// A default session reads the default perp dex; a builder (HIP-3) session
+    /// reads its own, whose open orders the default endpoint never returns.
+    async fn info_scoped_frontend_open_orders(&self, user: &str) -> Result<Value> {
+        let account_dex = self.dex_scope.account_dex();
+        self.info_frontend_open_orders_for_dex(user, account_dex.as_ref().map(Ustr::as_str))
+            .await
     }
 
     async fn info_frontend_open_orders_for_dex(
@@ -2296,6 +2318,10 @@ impl HyperliquidHttpClient {
                     }
                 };
 
+                if !self.dex_scope.owns_coin(order.coin.as_str()) {
+                    continue;
+                }
+
                 let instrument = match self.get_or_create_instrument(&order.coin, None) {
                     Some(instrument) => instrument,
                     None => continue,
@@ -2326,6 +2352,9 @@ impl HyperliquidHttpClient {
     /// The venue bounds this endpoint to its 2,000 most recent historical
     /// orders. Mass-status reconciliation narrows these reports to venue order
     /// IDs represented by the retained fill window.
+    ///
+    /// `historicalOrders` covers the whole wallet, so entries are narrowed to
+    /// the collateral pools this session owns.
     pub async fn request_historical_order_status_reports(
         &self,
         user: &str,
@@ -2339,6 +2368,10 @@ impl HyperliquidHttpClient {
         let ts_init = self.clock.get_time_ns();
 
         for entry in entries {
+            if !self.dex_scope.owns_coin(entry.order.coin.as_str()) {
+                continue;
+            }
+
             let instrument = match self.get_or_create_instrument(&entry.order.coin, None) {
                 Some(instrument) => instrument,
                 None => continue,
@@ -2408,9 +2441,11 @@ impl HyperliquidHttpClient {
 
     /// Request a single order status report by venue order ID.
     ///
-    /// Queries `info_frontend_open_orders` and filters for the given oid so the
-    /// result includes trigger metadata (trigger_px, tpsl, trailing_stop, etc.).
-    /// Falls back to `info_order_status` when the order is no longer open.
+    /// Queries `frontendOpenOrders` for the pool this session is pinned to and
+    /// filters for the given oid so the result includes trigger metadata
+    /// (trigger_px, tpsl, trailing_stop, etc.). Falls back to
+    /// `info_order_status` when the order is no longer open. An oid settling
+    /// outside this session's pools yields `None`.
     ///
     /// # Errors
     ///
@@ -2430,7 +2465,8 @@ impl HyperliquidHttpClient {
         // A transport error here must not abort the call: the oid fallback to
         // info_order_status below still covers closed orders, so a transient
         // frontendOpenOrders outage is downgraded to a warning.
-        let orders: Vec<WsBasicOrderData> = match self.info_frontend_open_orders(user).await {
+        let orders: Vec<WsBasicOrderData> = match self.info_scoped_frontend_open_orders(user).await
+        {
             Ok(response) => match serde_json::from_value(response) {
                 Ok(v) => v,
                 Err(e) => {
@@ -2446,7 +2482,10 @@ impl HyperliquidHttpClient {
             }
         };
 
-        if let Some(order) = orders.into_iter().find(|o| o.oid == oid) {
+        if let Some(order) = orders
+            .into_iter()
+            .find(|o| o.oid == oid && self.dex_scope.owns_coin(o.coin.as_str()))
+        {
             let instrument = match self.get_or_create_instrument(&order.coin, None) {
                 Some(inst) => inst,
                 None => return Ok(None),
@@ -2479,6 +2518,10 @@ impl HyperliquidHttpClient {
             Some(e) => e,
             None => return Ok(None),
         };
+
+        if !self.dex_scope.owns_coin(entry.order.coin.as_str()) {
+            return Ok(None);
+        }
 
         let instrument = match self.get_or_create_instrument(&entry.order.coin, None) {
             Some(inst) => inst,
@@ -2531,8 +2574,9 @@ impl HyperliquidHttpClient {
 
     /// Request a single order status report by client order ID.
     ///
-    /// Searches `info_frontend_open_orders` for an order whose cloid matches the
-    /// cached CLOID or the generated CLOID. Only finds open orders.
+    /// Searches `frontendOpenOrders` for the pool this session is pinned to,
+    /// for an order whose cloid matches the cached CLOID or the generated
+    /// CLOID. Only finds open orders.
     ///
     /// # Errors
     ///
@@ -2554,8 +2598,8 @@ impl HyperliquidHttpClient {
         let cloid = Cloid::from_client_order_id(*client_order_id);
         let cloid_hex = cloid.to_hex();
 
-        let response = self.info_frontend_open_orders(user).await?;
-        let orders: Vec<WsBasicOrderData> = match serde_json::from_value(response) {
+        let orders = self.info_scoped_frontend_open_orders(user).await?;
+        let orders: Vec<WsBasicOrderData> = match serde_json::from_value(orders) {
             Ok(v) => v,
             Err(e) => {
                 log::warn!("Failed to parse frontend open orders response: {e}");
@@ -2564,9 +2608,10 @@ impl HyperliquidHttpClient {
         };
 
         let order = match orders.into_iter().find(|o| {
-            o.cloid
-                .as_ref()
-                .is_some_and(|c| cached_cloid_hex.as_ref() == Some(c) || c == &cloid_hex)
+            self.dex_scope.owns_coin(o.coin.as_str())
+                && o.cloid
+                    .as_ref()
+                    .is_some_and(|c| cached_cloid_hex.as_ref() == Some(c) || c == &cloid_hex)
         }) {
             Some(o) => o,
             None => return Ok(None),
@@ -2606,6 +2651,10 @@ impl HyperliquidHttpClient {
     /// Fetches user fills via `info_user_fills` and parses them into FillReports.
     /// This method requires instruments to be added to the client cache via `cache_instrument()`.
     ///
+    /// `userFills` covers the whole wallet, so fills are narrowed to the collateral
+    /// pool named by `account_dex`: a builder (HIP-3) session keeps that dex's coins
+    /// alone, a default session keeps the default perp, spot, and vault coins alone.
+    ///
     /// For vault tokens (starting with "vntls:") that are not in the cache, synthetic instruments
     /// will be created automatically.
     ///
@@ -2628,6 +2677,10 @@ impl HyperliquidHttpClient {
         let ts_init = self.clock.get_time_ns();
 
         for fill in fills_response {
+            if !self.dex_scope.owns_coin(fill.coin.as_str()) {
+                continue;
+            }
+
             // Get instrument from cache or create synthetic for vault tokens
             let instrument = match self.get_or_create_instrument(&fill.coin, None) {
                 Some(inst) => inst,
@@ -2653,10 +2706,13 @@ impl HyperliquidHttpClient {
 
     /// Request position status reports for a user.
     ///
-    /// Fetches clearinghouse state from the default and all cached builder dexes when unfiltered,
+    /// Fetches clearinghouse state from every collateral pool this session owns when unfiltered,
     /// plus spot clearinghouse state, then returns the union of perp asset positions (short/long
     /// with PnL) and spot holdings (long only). This method requires instruments to be added to the
     /// client cache via `cache_instrument()`.
+    ///
+    /// A builder (HIP-3) session margins its own collateral, so it reports that
+    /// dex's positions alone: spot holdings belong to the default session.
     ///
     /// When `instrument_id` resolves to a specific product type, the opposite
     /// product's endpoint is skipped to avoid wasted round trips and make
@@ -2690,16 +2746,20 @@ impl HyperliquidHttpClient {
             filter_product,
             Some(HyperliquidProductType::Spot | HyperliquidProductType::Outcome)
         );
-        let fetch_spot = filter_product != Some(HyperliquidProductType::Perp);
+        // Spot settles in the default pool, so a pinned session skips it entirely.
+        let fetch_spot =
+            filter_product != Some(HyperliquidProductType::Perp) && self.dex_scope.owns_dex(None);
 
         let mut reports = Vec::new();
         let ts_init = self.clock.get_time_ns();
 
         if !fetch_perp {
-            let spot_reports = self
-                .request_spot_position_status_reports(user, instrument_id)
-                .await?;
-            reports.extend(spot_reports);
+            if fetch_spot {
+                let spot_reports = self
+                    .request_spot_position_status_reports(user, instrument_id)
+                    .await?;
+                reports.extend(spot_reports);
+            }
             return Ok(reports);
         }
 
@@ -2721,6 +2781,10 @@ impl HyperliquidHttpClient {
                     .and_then(|position| position.get("coin"))
                     .and_then(|coin| coin.as_str())
                     .ok_or_else(|| Error::bad_request("coin not found in position"))?;
+
+                if !self.dex_scope.owns_coin(coin) {
+                    continue;
+                }
 
                 let instrument = match self.get_or_create_instrument(&Ustr::from(coin), None) {
                     Some(instrument) => instrument,
@@ -2777,7 +2841,7 @@ impl HyperliquidHttpClient {
         // A builder (HIP-3) dex margins its own collateral: with `account_dex`
         // set, that dex's clearinghouse is the whole account and spot balances
         // belong to the default session instead.
-        if let Some(dex) = self.account_dex {
+        if let Some(dex) = self.dex_scope.account_dex() {
             let state_response = self
                 .info_clearinghouse_state_for_dex(user, Some(dex.as_str()))
                 .await?;
@@ -2907,6 +2971,11 @@ impl HyperliquidHttpClient {
             // does not trigger a misleading cache-miss WARN. Revisit if
             // Hyperliquid ever introduces a USDC-base spot pair.
             if balance.coin.as_str() == "USDC" {
+                continue;
+            }
+
+            // Spot settles in the default pool: a pinned session owns none of it.
+            if !self.dex_scope.owns_coin(balance.coin.as_str()) {
                 continue;
             }
 
@@ -3618,20 +3687,29 @@ impl HyperliquidHttpClient {
         Ok(Some(report))
     }
 
+    /// Returns the collateral pools an unfiltered reconciliation sweep queries.
+    ///
+    /// An instrument filter narrows the sweep to that instrument's pool, and
+    /// yields nothing when the pool is outside this session's scope.
     fn reconciliation_dexes(&self, instrument_id: Option<InstrumentId>) -> Vec<Option<Ustr>> {
         if let Some(instrument_id) = instrument_id {
-            return vec![perp_dex_from_symbol(instrument_id.symbol.as_str())];
+            let dex = perp_dex_from_symbol(instrument_id.symbol.as_str());
+            return if self.dex_scope.owns_dex(dex) {
+                vec![dex]
+            } else {
+                Vec::new()
+            };
+        }
+
+        if let Some(dex) = self.dex_scope.account_dex() {
+            return vec![Some(dex)];
         }
 
         let cached = self.instruments.load();
         let mut builder_dexs = cached
             .keys()
             .filter_map(|symbol| perp_dex_from_symbol(symbol.as_str()))
-            .filter(|dex| {
-                self.reconciliation_dexs
-                    .as_ref()
-                    .is_none_or(|allowed| allowed.contains(dex))
-            })
+            .filter(|dex| self.dex_scope.owns_dex(Some(*dex)))
             .collect::<Vec<_>>();
         builder_dexs.sort_unstable_by(|a, b| a.as_str().cmp(b.as_str()));
         builder_dexs.dedup();
@@ -3641,13 +3719,6 @@ impl HyperliquidHttpClient {
         dexes.extend(builder_dexs.into_iter().map(Some));
         dexes
     }
-}
-
-fn perp_dex_from_symbol(symbol: &str) -> Option<Ustr> {
-    symbol
-        .strip_suffix("-PERP")?
-        .split_once(':')
-        .map(|(dex, _)| Ustr::from(dex))
 }
 
 /// Extracts the order-status payload from an exchange response.
@@ -4556,38 +4627,89 @@ mod tests {
         client.cache_instrument(&perp);
     }
 
-    #[rstest]
-    fn test_reconciliation_dexes_follow_the_configured_allowlist() {
+    fn three_pool_client(
+        account_dex: Option<&str>,
+        extra_dexes: Option<&[&str]>,
+    ) -> HyperliquidHttpClient {
         let mut client =
             HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
         cache_perp(&client, "BTC-USD-PERP");
         cache_perp(&client, "xyz:TSLA-USD-PERP");
         cache_perp(&client, "abc:GOLD-USD-PERP");
+        client.set_account_dex(account_dex.map(str::to_string));
+        client.set_reconciliation_dexs(
+            extra_dexes.map(|dexes| dexes.iter().map(|dex| (*dex).to_string()).collect()),
+        );
+        client
+    }
 
-        assert_eq!(
-            client.reconciliation_dexes(None),
-            vec![None, Some(Ustr::from("abc")), Some(Ustr::from("xyz"))],
+    fn dexes(names: &[Option<&str>]) -> Vec<Option<Ustr>> {
+        names.iter().map(|name| name.map(Ustr::from)).collect()
+    }
+
+    // A session sweeps the pools it owns and no others: pinned means one pool,
+    // unpinned means the default pool plus whatever it explicitly opted into.
+    #[rstest]
+    #[case(None, None, &[None])]
+    #[case(None, Some(&[][..]), &[None])]
+    #[case(None, Some(&["xyz"][..]), &[None, Some("xyz")])]
+    #[case(None, Some(&["abc", "xyz"][..]), &[None, Some("abc"), Some("xyz")])]
+    #[case(Some("xyz"), None, &[Some("xyz")])]
+    #[case(Some("xyz"), Some(&["abc"][..]), &[Some("xyz")])]
+    #[case(Some("abc"), Some(&["abc", "xyz"][..]), &[Some("abc")])]
+    fn test_reconciliation_dexes_sweep_the_owned_pools(
+        #[case] account_dex: Option<&str>,
+        #[case] extra_dexes: Option<&[&str]>,
+        #[case] expected: &[Option<&str>],
+    ) {
+        let client = three_pool_client(account_dex, extra_dexes);
+
+        assert_eq!(client.reconciliation_dexes(None), dexes(expected));
+    }
+
+    // An instrument filter narrows the sweep to that instrument's pool, and
+    // yields nothing at all when the pool is outside the session's scope.
+    #[rstest]
+    #[case(None, "BTC-USD-PERP", &[None][..])]
+    #[case(None, "xyz:TSLA-USD-PERP", &[])]
+    #[case(None, "abc:GOLD-USD-PERP", &[])]
+    #[case(Some("xyz"), "BTC-USD-PERP", &[])]
+    #[case(Some("xyz"), "xyz:TSLA-USD-PERP", &[Some("xyz")][..])]
+    #[case(Some("xyz"), "abc:GOLD-USD-PERP", &[])]
+    #[case(Some("abc"), "BTC-USD-PERP", &[])]
+    #[case(Some("abc"), "xyz:TSLA-USD-PERP", &[])]
+    #[case(Some("abc"), "abc:GOLD-USD-PERP", &[Some("abc")][..])]
+    fn test_reconciliation_dexes_drop_an_out_of_scope_instrument_filter(
+        #[case] account_dex: Option<&str>,
+        #[case] symbol: &str,
+        #[case] expected: &[Option<&str>],
+    ) {
+        let client = three_pool_client(account_dex, None);
+        let filtered = InstrumentId::new(Symbol::new(symbol), *HYPERLIQUID_VENUE);
+
+        assert_eq!(client.reconciliation_dexes(Some(filtered)), dexes(expected));
+    }
+
+    // A wallet that never touched a builder dex sweeps the default pool alone,
+    // whatever the knobs say.
+    #[rstest]
+    #[case(None, None)]
+    #[case(None, Some(&["xyz"][..]))]
+    fn test_reconciliation_dexes_on_a_default_only_wallet(
+        #[case] account_dex: Option<&str>,
+        #[case] extra_dexes: Option<&[&str]>,
+    ) {
+        let mut client =
+            HyperliquidHttpClient::new(HyperliquidEnvironment::Mainnet, 60, None).unwrap();
+        cache_perp(&client, "BTC-USD-PERP");
+        client.set_account_dex(account_dex.map(str::to_string));
+        client.set_reconciliation_dexs(
+            extra_dexes.map(|dexes| dexes.iter().map(|dex| (*dex).to_string()).collect()),
         );
 
-        client.set_reconciliation_dexs(Some(vec!["xyz".to_string()]));
-        assert_eq!(
-            client.reconciliation_dexes(None),
-            vec![None, Some(Ustr::from("xyz"))],
-        );
-
-        client.set_reconciliation_dexs(Some(Vec::new()));
         assert_eq!(client.reconciliation_dexes(None), vec![None]);
 
-        let filtered = InstrumentId::new(Symbol::new("abc:GOLD-USD-PERP"), *HYPERLIQUID_VENUE);
-        assert_eq!(
-            client.reconciliation_dexes(Some(filtered)),
-            vec![Some(Ustr::from("abc"))],
-        );
-
-        client.set_reconciliation_dexs(None);
-        assert_eq!(
-            client.reconciliation_dexes(None),
-            vec![None, Some(Ustr::from("abc")), Some(Ustr::from("xyz"))],
-        );
+        let filtered = InstrumentId::new(Symbol::new("BTC-USD-PERP"), *HYPERLIQUID_VENUE);
+        assert_eq!(client.reconciliation_dexes(Some(filtered)), vec![None]);
     }
 }

@@ -23,6 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::common::{
     consts::{info_url, ws_url},
     enums::HyperliquidEnvironment,
+    parse::DexScope,
 };
 
 /// Configuration for the Hyperliquid data client.
@@ -275,19 +276,20 @@ pub struct HyperliquidExecClientConfig {
     /// when the venue fill stream is unavailable.
     #[builder(default = 0)]
     pub outcome_settlement_poll_secs: u64,
-    /// Builder-deployed (HIP-3) dexes included in unfiltered open-order and
-    /// position reconciliation, by dex name.
+    /// Builder-deployed (HIP-3) dexes a default session additionally owns, by
+    /// dex name.
     ///
-    /// `None` queries every builder dex represented by the cached perpetual
-    /// instruments; an empty list queries only the default perp dex. The default
-    /// dex is always queried.
+    /// `None` and an empty list both keep the session on the default pool
+    /// alone; naming a dex opts its orders, fills and positions in as well. A
+    /// session with `account_dex` set ignores this list: it owns its own pool.
     pub reconciliation_dexs: Option<Vec<String>>,
-    /// The collateral pool the account state reads.
+    /// The collateral pool this session owns.
     ///
-    /// `None` reads the default perp clearinghouse combined with spot balances.
-    /// A builder (HIP-3) dex name reads that dex's clearinghouse alone: builder
+    /// `None` owns the default perp clearinghouse combined with spot balances.
+    /// A builder (HIP-3) dex name owns that dex's clearinghouse alone: builder
     /// dexes margin their own collateral, so a session trading one reports that
-    /// pool rather than a sum no venue arithmetic uses.
+    /// pool rather than a sum no venue arithmetic uses, and reads none of the
+    /// other pools' orders, fills or positions.
     pub account_dex: Option<String>,
 }
 
@@ -325,6 +327,33 @@ impl HyperliquidExecClientConfig {
         self.private_key
             .as_deref()
             .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// Returns the collateral pools this session owns.
+    ///
+    /// One scope drives every execution surface: HTTP reconciliation, the user
+    /// WebSocket streams, and the account state all read the same pools, so two
+    /// sessions on one wallet never see each other's orders, fills or positions.
+    #[must_use]
+    pub fn dex_scope(&self) -> DexScope {
+        DexScope::new(
+            self.account_dex.as_deref().map(ustr::Ustr::from),
+            self.reconciliation_dexs
+                .iter()
+                .flatten()
+                .map(|dex| ustr::Ustr::from(dex))
+                .collect(),
+        )
+    }
+
+    /// Returns whether this session runs the HIP-4 outcome settlement poll.
+    ///
+    /// Outcome tokens are default-pool spot holdings, so a session pinned to a
+    /// builder (HIP-3) dex never dispatches their settlement fills: the default
+    /// session on the same wallet owns them.
+    #[must_use]
+    pub fn runs_outcome_settlement_poll(&self) -> bool {
+        self.outcome_settlement_poll_secs > 0 && self.account_dex.is_none()
     }
 
     /// Returns the WebSocket URL, respecting the environment and overrides.
@@ -491,6 +520,56 @@ stale_stream_max_targeted_resubscribes = 5
 
         assert!(debug.contains("[REDACTED]"));
         assert!(!debug.contains("0123456789abcdef"));
+    }
+
+    // The scope a config hands every execution surface: pinned owns one pool,
+    // unpinned owns the default pool plus whatever it opted into.
+    #[rstest]
+    #[case(None, None, "BTC", true)]
+    #[case(None, None, "xyz:X", false)]
+    #[case(None, Some(&["xyz"][..]), "xyz:X", true)]
+    #[case(None, Some(&["xyz"][..]), "abc:Y", false)]
+    #[case(Some("xyz"), None, "BTC", false)]
+    #[case(Some("xyz"), None, "xyz:X", true)]
+    #[case(Some("xyz"), Some(&["abc"][..]), "abc:Y", false)]
+    #[case(Some("abc"), Some(&["xyz"][..]), "abc:Y", true)]
+    fn test_exec_config_dex_scope(
+        #[case] account_dex: Option<&str>,
+        #[case] reconciliation_dexs: Option<&[&str]>,
+        #[case] coin: &str,
+        #[case] expected: bool,
+    ) {
+        let config = HyperliquidExecClientConfig {
+            account_dex: account_dex.map(str::to_string),
+            reconciliation_dexs: reconciliation_dexs
+                .map(|dexs| dexs.iter().map(|dex| (*dex).to_string()).collect()),
+            ..HyperliquidExecClientConfig::default()
+        };
+
+        assert_eq!(config.dex_scope().owns_coin(coin), expected);
+    }
+
+    // Outcome settlements come out of default-pool spot, so only a default
+    // session with the poll enabled dispatches them.
+    #[rstest]
+    #[case(0, None, false)]
+    #[case(0, Some("xyz"), false)]
+    #[case(0, Some("abc"), false)]
+    #[case(30, None, true)]
+    #[case(30, Some("xyz"), false)]
+    #[case(30, Some("abc"), false)]
+    fn test_runs_outcome_settlement_poll(
+        #[case] poll_secs: u64,
+        #[case] account_dex: Option<&str>,
+        #[case] expected: bool,
+    ) {
+        let config = HyperliquidExecClientConfig {
+            outcome_settlement_poll_secs: poll_secs,
+            account_dex: account_dex.map(str::to_string),
+            ..HyperliquidExecClientConfig::default()
+        };
+
+        assert_eq!(config.runs_outcome_settlement_poll(), expected);
     }
 
     #[rstest]

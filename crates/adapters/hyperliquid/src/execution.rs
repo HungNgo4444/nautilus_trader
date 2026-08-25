@@ -161,10 +161,11 @@ use crate::{
         credential::Secrets,
         enums::HyperliquidProductType,
         parse::{
-            clamp_price_to_precision, derive_limit_from_trigger, derive_market_order_price,
-            extract_error_message, extract_inner_error, extract_inner_errors, normalize_price,
+            DexScope, clamp_price_to_precision, derive_limit_from_trigger,
+            derive_market_order_price, extract_error_message, extract_inner_error,
+            extract_inner_errors, normalize_price,
             order_to_hyperliquid_request_with_asset_and_cloid, parse_account_balances_and_margins,
-            parse_combined_account_balances_and_margins, round_to_sig_figs,
+            parse_combined_account_balances_and_margins, perp_dex_from_symbol, round_to_sig_figs,
         },
         socket::{SocketStatePublisher, USER_STREAMS_ENDPOINT},
     },
@@ -225,6 +226,15 @@ impl HyperliquidExecutionClient {
         &self.ws_dispatch_state
     }
 
+    /// Returns the collateral pools this session's user streams are narrowed to.
+    ///
+    /// The user streams cover the whole wallet, so this scope is what keeps two
+    /// sessions on one wallet from reading each other's orders and fills.
+    #[must_use]
+    pub fn ws_dex_scope(&self) -> &DexScope {
+        self.ws_client.dex_scope()
+    }
+
     /// Returns `true` when every background task spawned via `spawn_task`
     /// has completed.
     ///
@@ -249,6 +259,29 @@ impl HyperliquidExecutionClient {
 
     fn validate_order_submission(&self, order: &OrderAny) -> anyhow::Result<()> {
         validate_order_for_hyperliquid(order)
+    }
+
+    /// Returns why `order` settles outside the collateral pool of this session.
+    ///
+    /// The test is symmetric: a session pinned to a builder (HIP-3) dex refuses
+    /// default-pool instruments, and a default session refuses builder coins it
+    /// never opted into through `reconciliation_dexs`. Either way the order
+    /// would draw on collateral this session neither funds nor reconciles, so
+    /// it is denied at the submit gate instead of reaching the venue.
+    fn out_of_scope_reason(&self, order: &OrderAny) -> Option<String> {
+        let instrument_id = order.instrument_id();
+        let scope = self.config.dex_scope();
+        let symbol = instrument_id.symbol;
+
+        if scope.owns_symbol(symbol.as_str()) {
+            return None;
+        }
+
+        Some(format!(
+            "Instrument {instrument_id} settles in {}, but this session trades {}",
+            describe_pool(perp_dex_from_symbol(symbol.as_str())),
+            describe_session_pools(&scope),
+        ))
     }
 
     fn order_request(
@@ -427,8 +460,11 @@ impl HyperliquidExecutionClient {
         http_client.set_normalize_prices(config.normalize_prices);
         http_client.set_market_order_slippage_bps(config.market_order_slippage_bps);
         http_client.set_include_builder_attribution(config.include_builder_attribution);
-        http_client.set_reconciliation_dexs(config.reconciliation_dexs.clone());
-        http_client.set_account_dex(config.account_dex.clone());
+        // One scope for both transports: HTTP reconciliation and the user
+        // WebSocket streams must own the same collateral pools, or a session
+        // adopts orders whose fills never reach it.
+        let dex_scope = config.dex_scope();
+        http_client.set_dex_scope(dex_scope.clone());
 
         // Apply URL overrides from config (used for testing with mock servers)
         if let Some(url) = &config.base_url_http {
@@ -453,6 +489,7 @@ impl HyperliquidExecutionClient {
             ws_client = ws_client.with_socket_control(publisher.control(USER_STREAMS_ENDPOINT));
         }
         ws_client.set_post_timeout(Duration::from_secs(config.ws_post_timeout_secs));
+        ws_client.set_dex_scope(dex_scope);
 
         let clock = get_atomic_clock_realtime();
         let emitter = ExecutionEventEmitter::new(
@@ -631,8 +668,11 @@ impl HyperliquidExecutionClient {
 
     fn start_outcome_settlement_poll(&mut self) -> anyhow::Result<()> {
         let poll_secs = self.config.outcome_settlement_poll_secs;
-        if poll_secs == 0 {
-            log::debug!("Outcome settlement polling disabled by config");
+        if !self.config.runs_outcome_settlement_poll() {
+            log::debug!(
+                "Outcome settlement polling disabled (poll_secs={poll_secs}, account_dex={:?})",
+                self.config.account_dex,
+            );
             return Ok(());
         }
 
@@ -810,6 +850,12 @@ impl ExecutionClient for HyperliquidExecutionClient {
             return Ok(());
         }
 
+        if let Some(reason) = self.out_of_scope_reason(&order) {
+            log::warn!("Cannot submit order {}: {reason}", order.client_order_id());
+            self.emitter.emit_order_denied(&order, &reason);
+            return Ok(());
+        }
+
         if let Err(e) = self.validate_order_submission(&order) {
             self.emitter
                 .emit_order_denied(&order, &format!("Validation failed: {e}"));
@@ -957,6 +1003,21 @@ impl ExecutionClient for HyperliquidExecutionClient {
         let slippage_bps = self.resolve_slippage_bps(cmd.params.as_ref());
 
         let orders = self.core.get_orders_for_list(&cmd.order_list)?;
+
+        // WHY: a bracket or OCO list only holds together whole, so one leg
+        // outside the session pool denies every leg rather than leaving a
+        // half-armed list working on the venue.
+        if let Some(reason) = orders
+            .iter()
+            .find_map(|order| self.out_of_scope_reason(order))
+        {
+            let reason = format!("Order list denied: {reason}");
+            log::warn!("{reason}");
+            for order in &orders {
+                self.emitter.emit_order_denied(order, &reason);
+            }
+            return Ok(());
+        }
 
         let mut valid_orders = Vec::new();
         let mut hyperliquid_orders = Vec::new();
@@ -2621,6 +2682,34 @@ fn order_normal_tpsl_submission(
     });
 
     pairs.into_iter().unzip()
+}
+
+/// Names the collateral pool a builder (HIP-3) dex margins, or the default pool.
+fn describe_pool(dex: Option<Ustr>) -> String {
+    match dex {
+        Some(dex) => format!("builder dex '{dex}'"),
+        None => "the default pool".to_string(),
+    }
+}
+
+/// Names every collateral pool an execution session owns.
+fn describe_session_pools(scope: &DexScope) -> String {
+    if let Some(dex) = scope.account_dex() {
+        return describe_pool(Some(dex));
+    }
+
+    let extra_dexes = scope.extra_dexes();
+    if extra_dexes.is_empty() {
+        return describe_pool(None);
+    }
+
+    let names = extra_dexes
+        .iter()
+        .map(|dex| format!("'{dex}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    format!("the default pool and builder dexes {names}")
 }
 
 /// Validates that an order is acceptable for submission to Hyperliquid.

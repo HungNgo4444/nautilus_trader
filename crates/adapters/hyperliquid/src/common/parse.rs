@@ -76,6 +76,7 @@ use nautilus_model::{
     types::{AccountBalance, Currency, MarginBalance, Money},
 };
 use rust_decimal::Decimal;
+use ustr::Ustr;
 
 use crate::{
     common::{
@@ -363,6 +364,102 @@ pub fn cache_alias_for_symbol(symbol: &str) -> Option<String> {
         None
     } else {
         Some(leading.to_string())
+    }
+}
+
+/// Prefix reserved for vault tokens, which are spot holdings rather than a builder dex.
+pub const VAULT_TOKEN_PREFIX: &str = "vntls:";
+
+/// Returns the builder (HIP-3) dex a venue coin belongs to.
+///
+/// Builder coins carry a `{dex}:` prefix. Default perps, spot pairs, HIP-4
+/// outcome tokens, and vault tokens all return `None`.
+#[must_use]
+pub fn perp_dex_from_coin(coin: &str) -> Option<Ustr> {
+    if coin.starts_with(VAULT_TOKEN_PREFIX) {
+        return None;
+    }
+
+    coin.split_once(':').map(|(dex, _)| Ustr::from(dex))
+}
+
+/// Returns the builder (HIP-3) dex a Nautilus perpetual symbol belongs to.
+#[must_use]
+pub fn perp_dex_from_symbol(symbol: &str) -> Option<Ustr> {
+    perp_dex_from_coin(symbol.strip_suffix("-PERP")?)
+}
+
+/// The collateral pools one execution session owns.
+///
+/// Hyperliquid reports orders, fills and positions per wallet, while a builder
+/// (HIP-3) dex margins its own collateral. Two sessions on one wallet only stay
+/// apart when each keeps the pool it was configured for: `account_dex` pins a
+/// session to one builder dex, and a default session owns the default perp,
+/// spot, outcome and vault coins plus the builder dexes it explicitly opted
+/// into through `extra_dexes`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DexScope {
+    account_dex: Option<Ustr>,
+    extra_dexes: Vec<Ustr>,
+}
+
+impl DexScope {
+    /// Creates a scope for a session pinned to `account_dex`, widened by `extra_dexes`.
+    ///
+    /// `extra_dexes` applies to a default session alone: a pinned session owns
+    /// exactly its own pool.
+    #[must_use]
+    pub fn new(account_dex: Option<Ustr>, extra_dexes: Vec<Ustr>) -> Self {
+        Self {
+            account_dex,
+            extra_dexes,
+        }
+    }
+
+    /// Returns the builder dex this session is pinned to, if any.
+    #[must_use]
+    pub const fn account_dex(&self) -> Option<Ustr> {
+        self.account_dex
+    }
+
+    /// Returns the builder dexes a default session additionally owns.
+    #[must_use]
+    pub fn extra_dexes(&self) -> &[Ustr] {
+        &self.extra_dexes
+    }
+
+    /// Pins this session to `account_dex`.
+    pub fn set_account_dex(&mut self, account_dex: Option<Ustr>) {
+        self.account_dex = account_dex;
+    }
+
+    /// Sets the builder dexes a default session additionally owns.
+    pub fn set_extra_dexes(&mut self, extra_dexes: Vec<Ustr>) {
+        self.extra_dexes = extra_dexes;
+    }
+
+    /// Returns whether this session owns the collateral pool named by `dex`.
+    #[must_use]
+    pub fn owns_dex(&self, dex: Option<Ustr>) -> bool {
+        match self.account_dex {
+            Some(pinned) => dex == Some(pinned),
+            None => match dex {
+                None => true,
+                Some(dex) => self.extra_dexes.contains(&dex),
+            },
+        }
+    }
+
+    /// Returns whether this session owns the pool a venue coin settles in.
+    #[must_use]
+    pub fn owns_coin(&self, coin: &str) -> bool {
+        self.owns_dex(perp_dex_from_coin(coin))
+    }
+
+    /// Returns whether this session owns the pool a Nautilus symbol settles in.
+    #[must_use]
+    pub fn owns_symbol(&self, symbol: &str) -> bool {
+        self.owns_dex(perp_dex_from_symbol(symbol))
     }
 }
 
@@ -2413,5 +2510,119 @@ mod tests {
         assert_eq!(balances.len(), 1);
         assert_eq!(balances[0].currency.code.as_str(), "USDC");
         assert_eq!(balances[0].total.as_decimal(), dec!(50));
+    }
+
+    #[rstest]
+    #[case("BTC", None)]
+    #[case("@107", None)]
+    #[case("#1230", None)]
+    #[case("+1231", None)]
+    #[case("vntls:vCURSOR", None)]
+    #[case("xyz:XYZ100", Some("xyz"))]
+    #[case("abc:GOLD", Some("abc"))]
+    fn test_perp_dex_from_coin(#[case] coin: &str, #[case] expected: Option<&str>) {
+        assert_eq!(perp_dex_from_coin(coin), expected.map(Ustr::from));
+    }
+
+    #[rstest]
+    #[case("BTC-USD-PERP", None)]
+    #[case("HYPE-USDC-SPOT", None)]
+    #[case("vntls:vCURSOR-USDC-SPOT", None)]
+    #[case("123-YES-OUTCOME", None)]
+    #[case("xyz:XYZ100-USD-PERP", Some("xyz"))]
+    fn test_perp_dex_from_symbol(#[case] symbol: &str, #[case] expected: Option<&str>) {
+        assert_eq!(perp_dex_from_symbol(symbol), expected.map(Ustr::from));
+    }
+
+    fn dex_scope(account_dex: Option<&str>, extra_dexes: &[&str]) -> DexScope {
+        DexScope::new(
+            account_dex.map(Ustr::from),
+            extra_dexes.iter().map(|dex| Ustr::from(dex)).collect(),
+        )
+    }
+
+    // The full {account_dex} x {coin dex} matrix: a session keeps its own pool
+    // and nothing else, in both directions.
+    #[rstest]
+    #[case(None, "BTC", true)]
+    #[case(None, "@107", true)]
+    #[case(None, "#1230", true)]
+    #[case(None, "vntls:vCURSOR", true)]
+    #[case(None, "xyz:XYZ100", false)]
+    #[case(None, "abc:GOLD", false)]
+    #[case(Some("xyz"), "BTC", false)]
+    #[case(Some("xyz"), "@107", false)]
+    #[case(Some("xyz"), "#1230", false)]
+    #[case(Some("xyz"), "vntls:vCURSOR", false)]
+    #[case(Some("xyz"), "xyz:XYZ100", true)]
+    #[case(Some("xyz"), "abc:GOLD", false)]
+    #[case(Some("abc"), "BTC", false)]
+    #[case(Some("abc"), "@107", false)]
+    #[case(Some("abc"), "#1230", false)]
+    #[case(Some("abc"), "vntls:vCURSOR", false)]
+    #[case(Some("abc"), "xyz:XYZ100", false)]
+    #[case(Some("abc"), "abc:GOLD", true)]
+    fn test_dex_scope_owns_coin(
+        #[case] account_dex: Option<&str>,
+        #[case] coin: &str,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(dex_scope(account_dex, &[]).owns_coin(coin), expected);
+    }
+
+    #[rstest]
+    #[case(None, "BTC-USD-PERP", true)]
+    #[case(None, "HYPE-USDC-SPOT", true)]
+    #[case(None, "123-YES-OUTCOME", true)]
+    #[case(None, "xyz:XYZ100-USD-PERP", false)]
+    #[case(None, "abc:GOLD-USD-PERP", false)]
+    #[case(Some("xyz"), "BTC-USD-PERP", false)]
+    #[case(Some("xyz"), "HYPE-USDC-SPOT", false)]
+    #[case(Some("xyz"), "123-YES-OUTCOME", false)]
+    #[case(Some("xyz"), "xyz:XYZ100-USD-PERP", true)]
+    #[case(Some("xyz"), "abc:GOLD-USD-PERP", false)]
+    #[case(Some("abc"), "BTC-USD-PERP", false)]
+    #[case(Some("abc"), "HYPE-USDC-SPOT", false)]
+    #[case(Some("abc"), "123-YES-OUTCOME", false)]
+    #[case(Some("abc"), "xyz:XYZ100-USD-PERP", false)]
+    #[case(Some("abc"), "abc:GOLD-USD-PERP", true)]
+    fn test_dex_scope_owns_symbol(
+        #[case] account_dex: Option<&str>,
+        #[case] symbol: &str,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(dex_scope(account_dex, &[]).owns_symbol(symbol), expected);
+    }
+
+    // `extra_dexes` widens a default session alone; a pinned session keeps its
+    // own pool no matter what the wider allowlist names.
+    #[rstest]
+    #[case(None, &["xyz"], "BTC", true)]
+    #[case(None, &["xyz"], "xyz:XYZ100", true)]
+    #[case(None, &["xyz"], "abc:GOLD", false)]
+    #[case(None, &["xyz", "abc"], "abc:GOLD", true)]
+    #[case(Some("xyz"), &["xyz", "abc"], "BTC", false)]
+    #[case(Some("xyz"), &["xyz", "abc"], "abc:GOLD", false)]
+    #[case(Some("xyz"), &["xyz", "abc"], "xyz:XYZ100", true)]
+    fn test_dex_scope_extra_dexes(
+        #[case] account_dex: Option<&str>,
+        #[case] extra_dexes: &[&str],
+        #[case] coin: &str,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            dex_scope(account_dex, extra_dexes).owns_coin(coin),
+            expected
+        );
+    }
+
+    #[rstest]
+    fn test_dex_scope_default_owns_the_default_pool_alone() {
+        let scope = DexScope::default();
+
+        assert_eq!(scope.account_dex(), None);
+        assert!(scope.extra_dexes().is_empty());
+        assert!(scope.owns_dex(None));
+        assert!(!scope.owns_dex(Some(Ustr::from("xyz"))));
     }
 }
